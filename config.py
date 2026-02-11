@@ -7,3 +7,4 @@ API_HASH = "329c7a07064aefb308847bc8c4555ffd"
 AUTH_BOT_USERNAME = "verificate_userinfo_bot"
 
 SESSION_FOLDER = "sessions"
+CHAT_FOLDER = "chats"

