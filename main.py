@@ -91,8 +91,14 @@ def is_user_authorized(user_id: int) -> bool:
 
 async def get_user_phone_by_username(username: str):
     """
-    Отримує номер телефону через username.
-    Це працює тому що username - публічна інформація.
+    Отримує номер телефону через username користувача.
+    Використовує власну сесію для запиту публічної інформації.
+
+    Args:
+        username: Username користувача (без @)
+
+    Returns:
+        str | None: Номер телефону або None якщо прихований/помилка
     """
     if not username:
         logger.info("❌ У користувача немає username")
@@ -104,22 +110,25 @@ async def get_user_phone_by_username(username: str):
         await client.connect()
 
         if not await client.is_user_authorized():
-            logger.error("❌ Власна сесія не авторизована")
+            logger.error("❌ Власна сесія не авторизована. Запусти create_my_session.py")
             return None
 
-        logger.info(f"🔍 Перевіряю номер для @{username}...")
+        logger.info(f"🔍 Перевіряю номер телефону для @{username}...")
 
         result = await get_phone_by_username(client, username)
 
-        if result and result['phone']:
+        if result and result.get('phone'):
+            logger.info(f"✅ Номер знайдено: {result['phone']}")
             return result['phone']
         else:
+            logger.info(f"🔒 Номер прихований для @{username}")
             return None
 
     except Exception as e:
-        logger.error(f"❌ Помилка: {e}")
+        logger.error(f"❌ Помилка при перевірці номера: {e}")
         return None
     finally:
+        await client.disconnect()
         await client.disconnect()
 
 
