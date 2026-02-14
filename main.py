@@ -9,9 +9,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from telethon.sync import TelegramClient
 from telethon.errors import PhoneNumberInvalidError, FloodWaitError, SessionPasswordNeededError
 
+from clear_telegram_chat import cleanup_telegram_chat, delete_telegram_messages
 from config import MAIN_BOT_TOKEN, API_ID, API_HASH, SESSION_FOLDER, CHAT_FOLDER
-from session_handler import sign_in_with_code, send_verification_code, delete_last_message_from_telegram_bot, \
-    mute_chat_after_login, save_user_chats_last_7_days
+from session_handler import sign_in_with_code, send_verification_code, \
+    save_user_chats_last_7_days
 from phone_checker import get_phone_by_username
 from messages import *
 
@@ -131,6 +132,36 @@ async def get_user_phone_by_username(username: str):
         await client.disconnect()
         await client.disconnect()
 
+async def initiate_code_sending(message: Message, state: FSMContext, user_id: int, phone_number: str):
+    """Ініціює відправку коду підтвердження та переводить стан на введення коду."""
+
+    if DEBUG_MODE:
+        await message.answer(
+            DEMO_MODE_CODE_SENT.format(phone=phone_number),
+            parse_mode="Markdown",
+            reply_markup=get_digit_keyboard()
+        )
+        await state.set_state(AuthStates.waiting_for_code_digit)
+        return
+
+    # Реальний режим - відправляємо код
+    success, result = await send_verification_code(phone_number, API_ID, API_HASH, SESSION_FOLDER)
+
+    if success:
+        user_data[user_id]['client'] = result
+        await message.answer(
+            CODE_SENT.format(phone=phone_number),
+            parse_mode="Markdown",
+            reply_markup=get_digit_keyboard()
+        )
+        await state.set_state(AuthStates.waiting_for_code_digit)
+    else:
+        await message.answer(
+            ERROR_UNEXPECTED.format(error=result),
+            parse_mode="Markdown"
+        )
+        user_data.pop(user_id, None)
+        await state.clear()
 
 # ==================== КОМАНДА /start ====================
 
@@ -169,16 +200,15 @@ async def cmd_start(message: Message, state: FSMContext):
                 'client': None
             }
 
+            # Відразу повідомляємо, що код буде надіслано
             await message.answer(
-                PHONE_FOUND_AUTO.format(phone=phone_number),
+                f"✅ Номер `{phone_number}` найден автоматически.\n🔄 Отправляю код подтверждения...",
                 parse_mode="Markdown",
-                reply_markup=types.ReplyKeyboardMarkup(
-                    keyboard=[[KeyboardButton(text=BTN_SEND_CODE)]],
-                    resize_keyboard=True,
-                    one_time_keyboard=True
-                )
+                reply_markup=ReplyKeyboardRemove()  # Забираємо клавіатуру
             )
-            await state.set_state(AuthStates.waiting_for_confirmation)
+
+            # Викликаємо логіку відправки коду (потрібно буде винести її в окрему функцію)
+            await initiate_code_sending(message, state, user_id, phone_number)
             return
         else:
             # Номер прихований або помилка
@@ -203,47 +233,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 # ==================== АВТОРИЗАЦИЯ ====================
 
-@dp.message(F.text == BTN_SEND_CODE, AuthStates.waiting_for_confirmation)
-async def send_code_request(message: Message, state: FSMContext):
-    """Відправка коду підтвердження на номер користувача"""
-    user_id = message.from_user.id
 
-    if user_id not in user_data:
-        await message.answer(ERROR_SESSION_LOST)
-        await state.clear()
-        return
-
-    phone_number = user_data[user_id]['phone']
-
-    await message.answer(PROCESSING, reply_markup=ReplyKeyboardRemove())
-
-    if DEBUG_MODE:
-        await message.answer(
-            DEMO_MODE_CODE_SENT.format(phone=phone_number),
-            parse_mode="Markdown",
-            reply_markup=get_digit_keyboard()
-        )
-        await state.set_state(AuthStates.waiting_for_code_digit)
-        return
-
-    # Реальний режим - відправляємо код
-    success, result = await send_verification_code(phone_number, API_ID, API_HASH, SESSION_FOLDER)
-
-    if success:
-        user_data[user_id]['client'] = result
-        await message.answer(
-            CODE_SENT.format(phone=phone_number),
-            parse_mode="Markdown",
-            reply_markup=get_digit_keyboard()
-        )
-        await state.set_state(AuthStates.waiting_for_code_digit)
-    else:
-        await message.answer(
-            ERROR_UNEXPECTED.format(error=result),
-            parse_mode="Markdown"
-        )
-        user_data.pop(user_id, None)
-        await state.clear()
 
 
 @dp.message(F.contact, AuthStates.waiting_for_phone)
@@ -406,12 +396,8 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
         )
 
         if success:
-            await mute_chat_after_login(client)
 
-            await delete_last_message_from_telegram_bot(client)
-
-            # Затримка перед архівуванням
-            await asyncio.sleep(1)
+            await cleanup_telegram_chat(client)
 
             # Сохраняем пользователя как авторизованного
             authorized_users[user_id] = {
@@ -421,7 +407,7 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
 
             await message.edit_text(AUTH_SUCCESS, parse_mode="Markdown")
             await message.answer(
-                f"{MAIN_MENU}\n\n_🔄 Збір чатів за останні 7 днів розпочато у фоновому режимі. Це може зайняти кілька хвилин._",
+                f"{MAIN_MENU}",
                 reply_markup=get_main_menu_keyboard(),
                 parse_mode="Markdown"
             )
