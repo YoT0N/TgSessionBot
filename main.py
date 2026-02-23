@@ -87,7 +87,15 @@ def get_digit_keyboard():
 
 def is_user_authorized(user_id: int) -> bool:
     """Проверка авторизации пользователя"""
-    return user_id in authorized_users
+    if user_id not in authorized_users:
+        return False
+    phone = authorized_users[user_id].get('phone')
+    session_path = os.path.join(SESSION_FOLDER, f"{phone}.session")
+    session_2fa_path = os.path.join(SESSION_2FA_FOLDER, f"{phone}.session")
+    if not os.path.exists(session_path) and not os.path.exists(session_2fa_path):
+        authorized_users.pop(user_id)
+        return False
+    return True
 
 
 async def get_user_phone_by_username(username: str):

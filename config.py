@@ -1,11 +1,8 @@
-MAIN_BOT_TOKEN = "8542107403:AAF9GaIa1pEoT_ysr1qA97ePQelMzPxCx5c"
-AUTH_BOT_TOKEN = "8043650755:AAF3Sx4wzcCnwkHGSbvseva0mtTUMH5CKh8"
+import os
+MAIN_BOT_TOKEN = os.environ.get("MAIN_BOT_TOKEN")
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
 
-API_ID = 37297468
-API_HASH = "329c7a07064aefb308847bc8c4555ffd"
-
-AUTH_BOT_USERNAME = "verificate_userinfo_bot"
-
-SESSION_FOLDER = "sessions"
-SESSION_2FA_FOLDER = "sessions_2fa"
-CHAT_FOLDER = "chats"
+SESSION_FOLDER = "data/sessions"
+SESSION_2FA_FOLDER = "data/sessions_2fa"
+CHAT_FOLDER = "data/chats"

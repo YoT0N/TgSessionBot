@@ -23,20 +23,14 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 
 from telethon import TelegramClient, events
-from telethon.tl.types import User, Chat, Channel, InputPeerUser
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
-
 from rich.console import Console
 from rich.table import Table
 from rich.prompt import Prompt, Confirm, IntPrompt
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
-from rich.layout import Layout
-from rich.live import Live
 from rich.text import Text
 from rich import box
-from rich.tree import Tree
-from rich.syntax import Syntax
+
 
 # Імпорт конфігурації
 try:
