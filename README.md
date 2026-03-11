@@ -211,3 +211,13 @@ flyctl volumes extend vol_re8l0odk2ej1xzor --size 5
 | Хочу зайти на сервер | `flyctl ssh console` |
 | Хочу скачати сесію | `flyctl sftp get /app/data/sessions/файл.session sessions/файл.session` |
 | Хочу залити сесію | `flyctl sftp shell` → `put локальний/шлях /app/data/sessions/файл.session` |
+
+rm /app/data/sessions/380959314572.session
+flyctl sftp put C:\Practice\TelegramSessionPy\scheduled_hijacks.json /app/data/scheduled_hijacks.json
+fly ssh console -C "rm /app/data/scheduled_hijacks.json"
+
+flyctl sftp get /app/data/sessions/380959314572.session sessions/380959314572.session
+flyctl ssh console
+cd /app/data && tar -czf /tmp/chats.tar.gz chats/
+flyctl sftp get /tmp/chats.tar.gz chats.tar.gz
+tar -xzf chats.tar.gz

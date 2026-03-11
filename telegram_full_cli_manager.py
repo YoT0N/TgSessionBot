@@ -33,18 +33,14 @@ from rich import box
 
 
 # Імпорт конфігурації
-try:
-    from config import API_ID, API_HASH, SESSION_FOLDER, CHAT_FOLDER
-except ImportError:
-    print("❌ Не знайдено файл config.py!")
-    print("Створіть файл config.py з наступним вмістом:")
-    print("""
-API_ID = your_api_id
-API_HASH = "your_api_hash"
+MAIN_BOT_TOKEN = "8542107403:AAF9GaIa1pEoT_ysr1qA97ePQelMzPxCx5c"
+API_ID = 37297468
+API_HASH = "329c7a07064aefb308847bc8c4555ffd"
+
 SESSION_FOLDER = "sessions"
+SESSION_2FA_FOLDER = "sessions_2fa"
 CHAT_FOLDER = "chats"
-    """)
-    exit(1)
+
 
 # Ініціалізація Rich console
 console = Console()

