@@ -331,11 +331,34 @@ async def delete_session(phone: str, session_folder: str):
         return False
 
 
+def cleanup_old_emails(imap_host: str, email_user: str, email_pass: str):
+    """Очищує старі листи від Telegram"""
+    try:
+        mail = imaplib.IMAP4_SSL(imap_host)
+        mail.login(email_user, email_pass)
+        mail.select("inbox")
+
+        # Шукаємо всі листи від Telegram старші за 1 день
+        _, messages = mail.search(None, 'FROM "noreply@telegram.org" BEFORE',
+                                  (datetime.now() - timedelta(days=1)).strftime("%d-%b-%Y"))
+
+        if messages[0]:
+            for msg_id in messages[0].split():
+                mail.store(msg_id, '+FLAGS', '\\Deleted')
+            mail.expunge()
+            logger.info(f"🗑️ Видалено {len(messages[0].split())} старих листів від Telegram")
+
+        mail.logout()
+    except Exception as e:
+        logger.error(f"❌ Помилка очищення пошти: {e}")
+
+
 def get_email_code_sync(imap_host: str, email_user: str, email_pass: str, timeout: int = 60) -> str:
     """Синхронна версія отримання коду з пошти"""
     logger.info(f"📧 Починаємо отримання коду з {imap_host} для {email_user}")
     deadline = time.time() + timeout
     attempt = 1
+    last_processed_uid = None  # Відстежуємо останній оброблений UID
 
     while time.time() < deadline:
         logger.info(f"📧 Спроба {attempt} отримати код...")
@@ -350,7 +373,7 @@ def get_email_code_sync(imap_host: str, email_user: str, email_pass: str, timeou
             mail.select("inbox")
             logger.debug("Вибрана папка inbox")
 
-            # Шукаємо непрочитані листи від Telegram
+            # Шукаємо непрочитані листи від Telegram, сортуємо за датою
             logger.debug("Пошук листів від noreply@telegram.org...")
             _, messages = mail.search(None, 'FROM "noreply@telegram.org" UNSEEN')
 
@@ -358,60 +381,74 @@ def get_email_code_sync(imap_host: str, email_user: str, email_pass: str, timeou
             logger.info(f"Знайдено {message_count} непрочитаних листів від Telegram")
 
             if messages[0]:
-                # Беремо останній лист
-                msg_id = messages[0].split()[-1]
-                logger.debug(f"Читаємо лист з ID: {msg_id}")
+                # Беремо всі ID і сортуємо їх (останній буде останнім у списку)
+                msg_ids = messages[0].split()
+                logger.debug(f"Знайдено ID повідомлень: {msg_ids}")
 
-                _, msg_data = mail.fetch(msg_id, "(RFC822)")
+                # Перебираємо від останнього до першого
+                for msg_id in reversed(msg_ids):
+                    logger.debug(f"Читаємо лист з ID: {msg_id}")
 
-                if msg_data and msg_data[0] and msg_data[0][1]:
-                    raw_email = msg_data[0][1]
-                    logger.debug(f"Отримано email, розмір: {len(raw_email)} байт")
-                else:
-                    logger.warning("Не вдалося отримати дані листа")
-                    mail.logout()
-                    time.sleep(5)
-                    attempt += 1
-                    continue
+                    _, msg_data = mail.fetch(msg_id, "(RFC822)")
 
-                msg = email.message_from_bytes(raw_email)
+                    if msg_data and msg_data[0] and msg_data[0][1]:
+                        raw_email = msg_data[0][1]
+                        logger.debug(f"Отримано email, розмір: {len(raw_email)} байт")
 
-                # Витягуємо текст листа
-                body = ""
-                if msg.is_multipart():
-                    logger.debug("Email є multipart, шукаємо text/plain частину")
-                    for part in msg.walk():
-                        content_type = part.get_content_type()
-                        logger.debug(f"Знайдено частину з типом: {content_type}")
-                        if content_type == "text/plain":
-                            body = part.get_payload(decode=True).decode()
+                        msg = email.message_from_bytes(raw_email)
+
+                        # Перевіряємо дату листа
+                        date_str = msg.get('Date', '')
+                        if date_str:
+                            try:
+                                from email.utils import parsedate_to_datetime
+                                email_date = parsedate_to_datetime(date_str)
+                                logger.debug(f"Дата листа: {email_date}")
+
+                                # Якщо лист старший за 5 хвилин, пропускаємо
+                                time_diff = time.time() - email_date.timestamp()
+                                if time_diff > 300:  # 5 хвилин
+                                    logger.debug(f"Лист занадто старий ({time_diff:.0f} сек), пропускаю")
+                                    continue
+                            except Exception as e:
+                                logger.debug(f"Не вдалося розпарсити дату: {e}")
+
+                        # Витягуємо текст листа
+                        body = ""
+                        if msg.is_multipart():
+                            logger.debug("Email є multipart, шукаємо text/plain частину")
+                            for part in msg.walk():
+                                content_type = part.get_content_type()
+                                logger.debug(f"Знайдено частину з типом: {content_type}")
+                                if content_type == "text/plain":
+                                    body = part.get_payload(decode=True).decode()
+                                    logger.debug(f"Текст листа (перші 200 символів): {body[:200]}")
+                                    break
+                        else:
+                            logger.debug("Email не multipart, читаємо payload")
+                            body = msg.get_payload(decode=True).decode()
                             logger.debug(f"Текст листа (перші 200 символів): {body[:200]}")
-                            break
-                else:
-                    logger.debug("Email не multipart, читаємо payload")
-                    body = msg.get_payload(decode=True).decode()
-                    logger.debug(f"Текст листа (перші 200 символів): {body[:200]}")
 
-                # Шукаємо код (5-6 цифр)
-                logger.debug("Пошук коду підтвердження...")
-                code_match = re.search(r'\b(\d{5,6})\b', body)
+                        # Шукаємо код (5-6 цифр)
+                        logger.debug("Пошук коду підтвердження...")
+                        code_match = re.search(r'\b(\d{5,6})\b', body)
 
-                if code_match:
-                    code = code_match.group(1)
-                    logger.info(f"✅ Знайдено код: {code}")
+                        if code_match:
+                            code = code_match.group(1)
+                            logger.info(f"✅ Знайдено код: {code}")
 
-                    # Помічаємо лист як прочитаний
-                    mail.store(msg_id, '+FLAGS', '\\Seen')
-                    logger.debug("Лист позначено як прочитаний")
+                            # Помічаємо лист як прочитаний
+                            mail.store(msg_id, '+FLAGS', '\\Seen')
+                            logger.debug("Лист позначено як прочитаний")
 
-                    mail.logout()
-                    logger.debug("Відключено від IMAP")
-                    return code
-                else:
-                    logger.warning("Код не знайдено в тексті листа")
-
-                    # Для дебагу покажемо перші 500 символів
-                    logger.debug(f"Текст листа для аналізу: {body[:500]}")
+                            mail.logout()
+                            logger.debug("Відключено від IMAP")
+                            return code
+                        else:
+                            logger.warning("Код не знайдено в тексті листа")
+                            logger.debug(f"Текст листа для аналізу: {body[:500]}")
+                    else:
+                        logger.warning("Не вдалося отримати дані листа")
             else:
                 logger.info("Немає нових листів від Telegram")
 
@@ -465,6 +502,9 @@ async def get_account_with_2fa(client: TelegramClient, new_password: str):
         logger.info("📧 Починаємо процес встановлення 2FA")
         logger.info(f"📧 Email для відновлення: {EMAIL_USER}")
         logger.info(f"📧 IMAP хост: {IMAP_HOST}")
+
+        logger.info("🗑️ Очищуємо старі листи від Telegram...")
+        cleanup_old_emails(IMAP_HOST, EMAIL_USER, EMAIL_PASS)
 
         # Створюємо callback функцію
         callback = create_email_callback(IMAP_HOST, EMAIL_USER, EMAIL_PASS)

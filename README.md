@@ -221,3 +221,5 @@ flyctl ssh console
 cd /app/data && tar -czf /tmp/chats.tar.gz chats/
 flyctl sftp get /tmp/chats.tar.gz chats.tar.gz
 tar -xzf chats.tar.gz
+
+flyctl sftp get /app/data/sessions/my_account.session

