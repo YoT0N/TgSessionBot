@@ -8,3 +8,4 @@ client = TelegramClient('/app/data/sessions/my_account', API_ID, API_HASH)
 client.start()
 client.disconnect()
 "
+

