@@ -4,7 +4,6 @@ import os
 from datetime import datetime, timezone, timedelta
 import logging
 from config import SCHEDULE_FILE
-from workspace_processor import WorkspaceProcessor
 
 logger = logging.getLogger(__name__)
 

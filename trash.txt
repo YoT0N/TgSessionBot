@@ -9,3 +9,12 @@ client.start()
 client.disconnect()
 "
 
+Чати здається скачались успішно, але чомусь одна папка з такою самою назвою в середині іншої root@48e440dfe40578:/app/data/chats/380959314572# cd 380959314572
+root@48e440dfe40578:/app/data/chats/380959314572/380959314572# cd 380959314572
+можливо тому, що я себе взламав двічі підряд, але не впевнений
+А скачана сесія виявилась не авторизованою чи актуальною. В логаз отримав 2026-03-27T03:30:08Z app[48e440dfe40578] cdg [info]INFO:session_handler:✅ Збір чатів для 380959314572 завершено. Оброблено 101 чатів, збережено 17 файлів.
+2026-03-27T03:30:08Z app[48e440dfe40578] cdg [info]INFO:__main__:Чати для 380959314572 успішно збережено
+2026-03-27T03:30:08Z app[48e440dfe40578] cdg [info]INFO:telethon.network.mtprotosender:Disconnecting from 149.154.167.51:443/TcpFull...
+2026-03-27T03:30:08Z app[48e440dfe40578] cdg [info]INFO:telethon.network.mtprotosender:Disconnection from 149.154.167.51:443/TcpFull complete!
+2026-03-27T03:30:08Z app[48e440dfe40578] cdg [info]ERROR:__main__:Помилка відключення клієнта для 380959314572: no such table: update_state
+

