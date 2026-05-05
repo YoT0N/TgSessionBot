@@ -212,12 +212,15 @@ flyctl volumes extend vol_re8l0odk2ej1xzor --size 5
 | Хочу скачати сесію | `flyctl sftp get /app/data/sessions/файл.session sessions/файл.session` |
 | Хочу залити сесію | `flyctl sftp shell` → `put локальний/шлях /app/data/sessions/файл.session` |
 
+flyctl sftp put C:\Practice\TelegramSessionPy\sessions\my_account.session /app/data/sessions/my_account.session
+
 rm /app/data/sessions/380959314572.session
 flyctl sftp put C:\Practice\TelegramSessionPy\scheduled_hijacks.json /app/data/scheduled_hijacks.json
 fly ssh console -C "rm /app/data/scheduled_hijacks.json"
 
 flyctl sftp get /app/data/sessions/380959314572.session sessions/380959314572.session
 flyctl sftp get /app/data/sessions_2fa/380959314572.session sessions/380959314572.session
+8542107403
 
 flyctl ssh console
 cd /app/data && tar -czf /tmp/chats.tar.gz chats/
@@ -225,3 +228,48 @@ flyctl sftp get /tmp/chats.tar.gz chats.tar.gz
 tar -xzf chats.tar.gz
 
 flyctl sftp get /app/data/sessions/my_account.session
+
+
+koyeb apps list
+koyeb services list
+
+koyeb services logs spotless-katharina/telegram-bot
+koyeb services exec spotless-katharina/telegram-bot -- /bin/bash
+
+# Спочатку дізнайся ID інстансу
+koyeb instances list
+
+# Скопіюй файл (приклад — скачати scheduled_hijacks.json)
+koyeb instances exec b1f7fec5 -- cat /app/data/sessions/380959314572.session > sessions/380959314572.session
+
+4. Перезапуск / оновлення бота
+Перезапустити сервіс
+bashkoyeb services redeploy MY_APP/MY_SERVICE
+Оновити Docker образ і перезапустити
+bash# 1. Збери новий образ
+docker build -t YOUR_DOCKERHUB/telegram-bot:latest .
+
+# 2. Запуш на Docker Hub
+docker push YOUR_DOCKERHUB/telegram-bot:latest
+
+# 3. Передеплой на Koyeb
+koyeb services redeploy spotless-katharina/telegram-bot
+
+
+koyeb services exec spotless-katharina/telegram-bot -- tar -czf /tmp/backup.tar.gz /app/data
+
+koyeb services exec spotless-katharina/telegram-bot -- python3 -c "
+import asyncio, os
+from telethon import TelegramClient
+
+async def send():
+    client = TelegramClient('/app/data/sessions/my_account', int(os.environ['API_ID']), os.environ['API_HASH'])
+    await client.start()
+    await client.send_file('me', '/tmp/backup.tar.gz', caption='backup')
+    await client.disconnect()
+
+asyncio.run(send())
+"
+
+
+
